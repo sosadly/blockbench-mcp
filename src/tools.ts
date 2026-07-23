@@ -35,7 +35,7 @@ const obj = (
   ...(required.length ? { required } : {}),
 });
 
-function text(value: unknown): ContentBlock[] {
+export function text(value: unknown): ContentBlock[] {
   // JSON.stringify(undefined) returns undefined (not a string), which would
   // produce an invalid content block ({type:"text", text: undefined}). Coerce.
   const body = (typeof value === "string" ? value : JSON.stringify(value, null, 2)) ?? "(undefined)";
