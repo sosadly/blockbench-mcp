@@ -36,7 +36,9 @@ const obj = (
 });
 
 function text(value: unknown): ContentBlock[] {
-  const body = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  // JSON.stringify(undefined) returns undefined (not a string), which would
+  // produce an invalid content block ({type:"text", text: undefined}). Coerce.
+  const body = (typeof value === "string" ? value : JSON.stringify(value, null, 2)) ?? "(undefined)";
   return [{ type: "text", text: body }];
 }
 
@@ -119,6 +121,18 @@ export const tools: ToolDef[] = [
     "export_project",
     "Export the project through its format's codec (e.g. Java model JSON, Bedrock geometry, GeckoLib model). Provide `path` to write a file directly.",
     obj({ path: { type: "string", description: "Absolute output path (optional)." } })
+  ),
+  forward(
+    "export_model",
+    "Export the open project to a file via a named codec (default glTF). Compiles the model — awaiting async codecs such as Codecs.gltf — and writes the result to `path`. For glTF the output is a self-contained .gltf JSON with embedded buffers/textures, importable by Godot/Unity/etc. Prefer this over execute_script for exports.",
+    obj(
+      {
+        path: { type: "string", description: "Absolute output file path (e.g. /abs/path/model.gltf)." },
+        codec: { type: "string", description: "Codec id (default 'gltf'). Others include 'bedrock', 'java_block', 'optifine_entity', etc. — the keys of Blockbench's Codecs map." },
+        format: { type: "string", description: "Format option passed to compile (e.g. 'gltf' or 'glb'). Defaults to the codec id." },
+      },
+      ["path"]
+    )
   ),
   forward(
     "load_project",
@@ -605,13 +619,13 @@ export const tools: ToolDef[] = [
   // ===== escape hatch ======================================================
   forward(
     "execute_script",
-    "Run arbitrary JavaScript inside Blockbench's renderer for anything not covered by a dedicated tool. The code has access to all Blockbench globals (Project, Cube, Group, Texture, Animation, Undo, Canvas, Outliner, Format, Formats, ...) and receives a `params` object. Return a JSON-serializable value. Use sparingly; prefer dedicated tools.",
+    "Run arbitrary JavaScript inside Blockbench's renderer for anything not covered by a dedicated tool. The code has access to all Blockbench globals (Project, Cube, Group, Texture, Animation, Undo, Canvas, Outliner, Format, Formats, ...) and receives a `params` object. The code runs as a function body — use an explicit `return` statement to produce a result (the last expression is NOT auto-returned). Returned Promises are awaited, so `return Codecs.gltf.compile(...)` resolves to the compiled value. Return a JSON-serializable value. Use sparingly; prefer dedicated tools (e.g. export_model for glTF export).",
     obj(
       {
         code: {
           type: "string",
           description:
-            "Function body. Example: \"return Cube.all.map(c => c.name)\". Wrap edits in Undo.initEdit/finishEdit and call Canvas.updateAll() after geometry changes.",
+            "Function body — MUST use an explicit `return` to produce a result (a bare trailing expression is NOT returned). Example: \"return Cube.all.map(c => c.name)\". Promises are awaited: \"return Codecs.gltf.compile({format:'glb'})\". Wrap edits in Undo.initEdit/finishEdit and call Canvas.updateAll() after geometry changes.",
         },
         params: { type: "object", description: "Optional object passed in as `params`." },
       },

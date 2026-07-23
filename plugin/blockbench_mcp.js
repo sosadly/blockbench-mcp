@@ -1156,6 +1156,19 @@ const commands = {
 		return { exported: true, note: 'Export dialog opened in Blockbench.' };
 	},
 
+	async export_model(p) {
+		requireProject();
+		if (!p || !p.path) throw new Error('path is required');
+		const codecId = p.codec || 'gltf';
+		const codec = Codecs[codecId];
+		if (!codec) throw new Error('Unknown codec: ' + codecId + '. Available: ' + Object.keys(Codecs).join(', '));
+		// codec.compile() may be sync or return a Promise (Codecs.gltf does).
+		const content = await codec.compile({ format: p.format || codecId });
+		const data = typeof content === 'string' ? content : JSON.stringify(content);
+		require('fs').writeFileSync(p.path, data);
+		return { exported: true, path: p.path, codec: codecId, bytes: data.length };
+	},
+
 	load_project(p) {
 		requireApp();
 		if (!p.path) throw new Error('path is required');
