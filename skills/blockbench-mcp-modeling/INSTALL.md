@@ -26,8 +26,12 @@ Edit the files in `d:/projects/blockbench-mcp/skills/blockbench-mcp-modeling/`, 
 `Compress-Archive -Path .\blockbench-mcp-modeling -DestinationPath .\blockbench-mcp-modeling.zip -Force`
 
 ## What's inside
-- `SKILL.md` — when to use, the golden workflow, hard rules, tool cheat-sheet, gotchas.
-- `references/workflow-and-scripts.md` — paste-ready execute_script snippets (UV packer, smooth
-  texture bake, feature painting, procedural decoration, pose preview, exports).
-- `references/proportions-and-review.md` — animal/humanoid proportions + review discipline.
-- `references/rigging-and-animation.md` — rigs, rotation-sign facts, idle/walk/run/attack/sleep recipes.
+- `SKILL.md` — the cube budget, the 4-layer doctrine, the banned shapes, the procedural
+  generators, the pipeline, hard rules, tool cheat-sheet and gotchas.
+- `references/workflow-and-scripts.md` — paste-ready execute_script snippets (matrix voxelizer,
+  array generator, hollow shell, UV packer, smooth texture bake, feature painting, density
+  audit, pose preview, exports).
+- `references/proportions-and-review.md` — animal/humanoid proportions, the density gate and the
+  per-pass review checklist (flat surfaces, z-fighting, layering).
+- `references/rigging-and-animation.md` — rigs, bone chains, rotation-sign facts,
+  idle/walk/run/attack/sleep recipes.
