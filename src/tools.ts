@@ -1162,7 +1162,7 @@ const catalogue: ToolDef[] = [
         code: {
           type: "string",
           description:
-            "Function body — an explicit `return` is required (a trailing expression alone returns nothing). Example: \"return Cube.all.map(c => c.name)\". Returned Promises are awaited, e.g. \"return Codecs.gltf.compile({})\". Wrap edits in Undo.initEdit/finishEdit and call Canvas.updateAll() after geometry changes.",
+            "Function body — MUST use an explicit `return` to produce a result (a bare trailing expression is NOT returned). Example: \"return Cube.all.map(c => c.name)\". Promises are awaited: \"return Codecs.gltf.compile({format:'glb'})\". Wrap edits in Undo.initEdit/finishEdit and call Canvas.updateAll() after geometry changes.",
         },
         params: { type: "object", description: "Optional object passed in as `params`." },
       },
