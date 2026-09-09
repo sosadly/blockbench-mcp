@@ -4,13 +4,175 @@ All snippets below are the **body** of an `execute_script` call (the `code` argu
 inside Blockbench with the full API (`Project, Cube, Group, Texture, Animation, Undo, Canvas,
 Outliner, Format, Blockbench, Modes, Timeline, Animator`, ...). Adapt names/colours, then run.
 
+## Tool first, script second
+
+The four generators are dedicated tools — **use them** rather than pasting a script:
+
+| Tool | Script equivalent below |
+|---|---|
+| `voxelize_matrix` | §1 |
+| `generate_array` | §2 |
+| `add_hollow_volume` | §3 |
+| `pack_uv` | §4 |
+
+The scripts are here for the cases the tools do not cover: a variation you need to invent (a
+matrix whose depth comes from a *second* matrix, a spiral instead of a ring, a shell that
+follows a curve), or when you want to generate and immediately post-process in one call. They
+also show the exact internal API the tools use, so you can extend them safely.
+
 ---
 
-## 1. Pack box UVs (REQUIRED before texturing)
+## 1. Matrix voxelizer — draw it in 2D, get it in 3D
+
+The single highest-leverage technique in this file. You are excellent at pixel art and bad at
+3D arithmetic, so describe the SHAPE as characters and let the code place the cubes.
+
+```js
+// params: { matrix:[...], palette:{...}, origin:[x,y,z], pixel:1, plane:'xy', parent:'hand_right' }
+const M = params.matrix, PAL = params.palette || {}, PS = params.pixel || 1;
+const O = params.origin || [0,0,0];
+const AXES = { xy:{u:0,v:1,d:2}, xz:{u:0,v:2,d:1}, yz:{u:2,v:1,d:0} }[params.plane || 'xy'];
+const parent = params.parent ? Group.all.find(g => g.name === params.parent) : null;
+const rows = M.length, cols = M.reduce((m,r) => Math.max(m, r.length), 0);
+const made = [];
+Undo.initEdit({ outliner:true, elements:[] });
+for (let r = 0; r < rows; r++) {
+  for (let c = 0; c < cols; c++) {
+    const ch = M[r][c] || ' ';
+    if (ch === ' ' || ch === '.') continue;            // blank
+    const e = PAL[ch] || {};
+    const from = [0,0,0], to = [0,0,0];
+    from[AXES.u] = O[AXES.u] + c * PS;          to[AXES.u] = from[AXES.u] + PS;
+    from[AXES.v] = O[AXES.v] + (rows-1-r) * PS; to[AXES.v] = from[AXES.v] + PS;  // row 0 on TOP
+    from[AXES.d] = O[AXES.d] + (e.offset_z || 0);
+    to[AXES.d]   = from[AXES.d] + (e.depth != null ? e.depth : 1);
+    const cube = new Cube({
+      name: (e.name || 'vox') + '_' + (made.length+1),
+      from, to, origin: from,
+      inflate: e.inflate || 0,
+      box_uv: !!Format.box_uv, autouv: Format.box_uv ? 0 : 1,
+    }).init();
+    cube.addTo(parent || 'root');
+    if (Texture.all.length) cube.applyTexture(Texture.getDefault(), true);
+    made.push(cube.name);
+  }
+}
+Undo.finishEdit('voxelize'); Canvas.updateAll();
+return { created: made.length, grid:[cols, rows] };
+```
+
+Call it with, for example, a scythe blade in the side plane:
+
+```json
+{"matrix":["......####",".....#####","...#######","..######..",".#####....","######....","#####.....","####......"],
+ "palette":{"#":{"name":"blade","depth":1}},
+ "plane":"yz","origin":[0,18,-4],"pixel":1,"parent":"hand_right"}
+```
+
+**Rules of thumb.** Draw the silhouette at 8–24 cells across — bigger grids just make cubes you
+cannot see. Give the *edge* character a smaller `depth` and a small `offset_z` so the blade
+tapers instead of reading as a slab. Use a second character for a fuller/inlay at
+`offset_z: -0.3` to break the flat face. Merge runs (`merge_adjacent` in the tool) when the
+shape is wide and solid.
+
+---
+
+## 2. Array generator — rows, rings and fringes
+
+Repeat one element with jitter, taper and an alternating depth so nothing z-fights.
+
+```js
+// params: { count:9, size:[2.2,5,1.2], start:[-6,7,3.2], end:[6,7,3.2],
+//           jitter:[0.15,0.4,0], decay:[-0.05,-0.25,0], stagger:0.12,
+//           tilt:[-9,9], anchor:'top', parent:'body', prefix:'hem' }
+const P = params, n = P.count;
+const parent = P.parent ? Group.all.find(g => g.name === P.parent) : null;
+const rnd = (a) => (Math.random()*2-1) * (a || 0);
+const made = [];
+Undo.initEdit({ outliner:true, elements:[] });
+for (let i = 0; i < n; i++) {
+  const t = n > 1 ? i/(n-1) : 0;
+  const pt = [0,1,2].map(k => P.start[k] + (P.end[k]-P.start[k])*t + rnd((P.jitter||[])[k]));
+  if (P.stagger && i % 2) pt[2] += P.stagger;                  // alternate depth: no z-fighting
+  const sz = [0,1,2].map(k => Math.max(0.05, P.size[k] + ((P.decay||[])[k]||0)*i));
+  const from = P.anchor === 'top'
+    ? [pt[0]-sz[0]/2, pt[1]-sz[1], pt[2]-sz[2]/2]               // hangs from the point
+    : [pt[0]-sz[0]/2, pt[1]-sz[1]/2, pt[2]-sz[2]/2];            // centred on it
+  const cube = new Cube({
+    name: (P.prefix || 'element') + '_' + (i+1),
+    from, to: [from[0]+sz[0], from[1]+sz[1], from[2]+sz[2]],
+    origin: pt,
+    rotation: P.tilt ? [0, 0, P.tilt[0] + Math.random()*(P.tilt[1]-P.tilt[0])] : [0,0,0],
+    box_uv: !!Format.box_uv, autouv: Format.box_uv ? 0 : 1,
+  }).init();
+  cube.addTo(parent || 'root');
+  if (Texture.all.length) cube.applyTexture(Texture.getDefault(), true);
+  made.push(cube.name);
+}
+Undo.finishEdit('array'); Canvas.updateAll();
+return { created: made.length };
+```
+
+Ring variant (teeth in a jaw, spikes around a collar) — swap the position line for:
+
+```js
+const th = (P.start_deg + (360/n)*i) * Math.PI/180;
+const pt = [P.center[0] + P.radii[0]*Math.cos(th), P.center[1], P.center[2] + P.radii[1]*Math.sin(th)];
+const faceOut = Math.atan2(-Math.cos(th), -Math.sin(th)) * 180/Math.PI;  // rotation[1]
+```
+
+**Anti-z-fighting checklist for any array:** step ≈ element width (small overlap only), a unique
+outer depth per piece (`stagger`, or `+ i*0.02`), never two pieces at identical x/y/z, and never
+two faces on the same plane. Run `check_model` afterwards and fix every `coplanar_overlap`.
+
+---
+
+## 3. Hollow shell — a cavity instead of a box
+
+Six slabs that tile the shell exactly, so the walls cannot overlap each other. `open` lists the
+faces to skip (`north` = -Z = the model's front).
+
+```js
+// params: { from:[-5,24,-5], to:[5,34,5], t:1.5, open:['north','down'], name:'hood', parent:'head' }
+const P = params, t = P.t || 1, open = new Set(P.open || []);
+const lo = P.from, hi = P.to, has = d => !open.has(d);
+const yLo = lo[1] + (has('down') ? t : 0), yHi = hi[1] - (has('up') ? t : 0);
+const zLo = lo[2] + (has('north') ? t : 0), zHi = hi[2] - (has('south') ? t : 0);
+const parent = P.parent ? Group.all.find(g => g.name === P.parent) : null;
+const walls = {
+  down:  [[lo[0], lo[1], lo[2]], [hi[0], lo[1]+t, hi[2]]],
+  up:    [[lo[0], hi[1]-t, lo[2]], [hi[0], hi[1], hi[2]]],
+  north: [[lo[0], yLo, lo[2]], [hi[0], yHi, lo[2]+t]],
+  south: [[lo[0], yLo, hi[2]-t], [hi[0], yHi, hi[2]]],
+  west:  [[lo[0], yLo, zLo], [lo[0]+t, yHi, zHi]],
+  east:  [[hi[0]-t, yLo, zLo], [hi[0], yHi, zHi]],
+};
+Undo.initEdit({ outliner:true, elements:[] });
+const made = [];
+for (const dir in walls) {
+  if (!has(dir)) continue;
+  const [f, to] = walls[dir];
+  if (to[0]-f[0] <= 0 || to[1]-f[1] <= 0 || to[2]-f[2] <= 0) continue;
+  const cube = new Cube({ name: (P.name||'shell') + '_' + dir, from: f, to, origin: f,
+    box_uv: !!Format.box_uv, autouv: Format.box_uv ? 0 : 1 }).init();
+  cube.addTo(parent || 'root');
+  if (Texture.all.length) cube.applyTexture(Texture.getDefault(), true);
+  made.push(cube.name);
+}
+Undo.finishEdit('hollow'); Canvas.updateAll();
+return { walls: made, cavity: { from:[lo[0]+(has('west')?t:0), yLo, zLo], to:[hi[0]-(has('east')?t:0), yHi, zHi] } };
+```
+
+Fill the returned cavity with the face, the skull, the glow core — keeping ≥0.1 clear of the
+walls so nothing z-fights.
+
+---
+
+## 4. Pack box UVs (REQUIRED before texturing)
 
 New box-UV cubes all overlap at `[0,0]`. This shelf-packs them and updates each cube's faces.
-Run it after every batch of `add_cubes` / resize. If `used_height` exceeds the texture height,
-raise the texture size (see snippet 5) and re-run.
+Run it after the LAST `add_cubes` / generator call. If `used_height` exceeds the texture height,
+raise the texture size (§8) and re-run. (The `pack_uv` tool does this with auto-resize.)
 
 ```js
 const TW = Project.texture_width, pad = 1;
@@ -33,15 +195,17 @@ return { packed: items.length, used: [maxX, y+rowH], tex: [TW, Project.texture_h
 ```
 
 Footprint math: a cube of size (w,h,d) unwraps to `2*(w+d)` wide and `(h+d)` tall, in texture
-pixels (1 unit = 1 px when `uv_width == texture_width`).
+pixels (1 unit = 1 px when `uv_width == texture_width`). A 150-cube model usually needs a
+128–256 px sheet; check `used` against the texture height and grow it before painting.
 
 ---
 
-## 2. Smooth texture bake (the core of "good textures")
+## 5. Smooth texture bake (the core of "good textures")
 
 Assigns the texture to every face (no gaps), then bakes a smooth, shaded base per face and
-blurs each island. Edit `baseFor(name)` to map cube-name → colour. Cubes named `*_core` are
-treated as emissive/glow. Paint crisp features AFTER this (snippet 3).
+blurs each island. Edit `baseFor(name)` to map cube-name → colour — which is why the generators
+let you name what they produce. Cubes named `*_core` are treated as emissive/glow. Paint crisp
+features AFTER this (§6).
 
 ```js
 const tex = Texture.all[0];
@@ -59,9 +223,11 @@ const GREENS=['#5f7a2e','#6d8a38','#7c9442','#56702a','#849a48'];
 const isGlow = n => /_core$/.test(n);
 function baseFor(n){
   if(isGlow(n))                 return '#3fe0d6';   // teal glow
-  if(/_cap$|_base$|chain|cord/.test(n)) return '#2a2620'; // dark frame/links
-  if(/antler|branch/.test(n))   return '#6b4a2e';   // wood brown
+  if(/_cap$|_base$|chain|cord|rivet|stud/.test(n)) return '#2a2620'; // dark metal/frame
+  if(/blade|edge/.test(n))      return '#b9c3cb';   // steel
+  if(/antler|branch|horn/.test(n)) return '#6b4a2e';
   if(/leaf|moss/.test(n))       return GREENS[(Math.random()*GREENS.length)|0];
+  if(/hem|fringe|cloak|shingle/.test(n)) return '#4a3b52'; // cloth
   if(/head|torso|body|limb|leg|arm/.test(n)) return '#c8bca0'; // pale body
   return '#6e4f30';                                  // default brown
 }
@@ -102,11 +268,12 @@ return {baked:true, cubes:Cube.all.length};
 ```
 
 Tuning: pale/smooth surfaces -> lower mottle (`*0.06`, amplitude `0.10`); fur/foliage -> higher.
-For grizzled backs add a few darker vertical streaks on `up` faces before the blur.
+For grizzled backs add a few darker vertical streaks on `up` faces before the blur. The
+`detail_cubes` tool does all of this with a `colors` regex list if you would rather not script it.
 
 ---
 
-## 3. Paint crisp features (eyes / nose / claws) — run AFTER the bake
+## 6. Paint crisp features (eyes / nose / claws) — run AFTER the bake
 
 Operate on a specific cube face using its UV rect; coordinates are face-relative.
 
@@ -116,7 +283,6 @@ const rectOf=f=>{const u=f.uv;return{x:Math.round(Math.min(u[0],u[2])),y:Math.ro
 const head=Cube.all.find(c=>c.name==='head'); const r=rectOf(head.faces.north);
 tex.edit((canvas)=>{ const ctx=canvas.getContext('2d'); ctx.imageSmoothingEnabled=false;
   const X=r.x,Y=r.y,W=r.w;
-  ctx.fillStyle='rgba(0,0,0,0)';
   // glowing teal almond eyes
   const eye=cx=>{ const cy=4;
     ctx.fillStyle='#0c1817'; ctx.fillRect(X+cx-1,Y+cy-1,4,6);   // dark socket
@@ -128,34 +294,29 @@ tex.edit((canvas)=>{ const ctx=canvas.getContext('2d'); ctx.imageSmoothingEnable
 Canvas.updateAll(); return {ok:true};
 ```
 
-The `mcp__blockbench__paint_faces` tool does the same with face-relative coords if you prefer
-not to script it.
+The `paint_faces` tool does the same with face-relative coords if you prefer not to script it.
 
 ---
 
-## 4. Procedural decoration (leaves / scales / fur tufts)
+## 7. Density audit in one line
 
-Generate many small decorative cubes around a body. KEEP CLIPPING LOW: few overlaps + stagger
-each piece's outer depth so faces don't z-fight.
+Before texturing, ask the model to grade itself. The `audit_complexity` tool does this properly
+(monoliths, layering, bare faces); this is the quick version when you just want the numbers.
 
 ```js
-const body=Group.all.find(g=>g.name==='body');
-Undo.initEdit({outliner:true, elements:[]});
-let n=0; const made=[]; const j=a=>(Math.random()*2-1)*a;
-const mk=(p,x,y,z,w,h,d)=>{ const c=new Cube({name:'leaf'+(n++),from:[x,y,z],to:[x+w,y+h,z+d],box_uv:true,autouv:0}).init(); c.addTo(p); made.push(c); return c; };
-// shingled rows on the BACK face (z=3), staggered depth avoids z-fighting:
-[20,16.5,13,9.5,6].forEach((y,ri)=>{ const off=(ri%2)*1.2, prot=(ri%2)?1.7:1.3;
-  for(let i=0;i<5;i++) mk(body, -5.8+off+i*2.45, y+j(0.12), 2.9, 2.9, 4.0, prot + i*0.07); });
-Undo.finishEdit('decorate'); Canvas.updateAll();
-return {added:made.length};
+const vol=c=>Math.abs((c.to[0]-c.from[0])*(c.to[1]-c.from[1])*(c.to[2]-c.from[2]));
+const total=Cube.all.reduce((s,c)=>s+vol(c),0)||1;
+const big=Cube.all.map(c=>({name:c.name, pct:Math.round(vol(c)/total*100)}))
+  .filter(e=>e.pct>15).sort((a,b)=>b.pct-a.pct);
+const micro=Cube.all.filter(c=>[0,1,2].every(k=>Math.abs(c.to[k]-c.from[k])<=2)).length;
+return { cubes:Cube.all.length, bones:Group.all.length, micro_pct:Math.round(micro/Cube.all.length*100), biggest:big };
 ```
 
-Then re-run snippet 1 (pack) and snippet 2 (bake). Anti-clip checklist: step ≈ width (small
-overlap only), unique outer depth per piece, don't stack two pieces at identical x,y,z.
+Any cube over ~30% of the total volume is a monolith: segment it and layer something on it.
 
 ---
 
-## 5. Resize the texture (when packing overflows)
+## 8. Resize the texture (when packing overflows)
 
 ```js
 const TW=160; Project.texture_width=TW; Project.texture_height=TW;
@@ -168,7 +329,7 @@ return {size:TW};
 
 ---
 
-## 6. Preview an animation pose (then screenshot it)
+## 9. Preview an animation pose (then screenshot it)
 
 ```js
 const a=Animation.all.find(x=>x.name===params.name);
@@ -180,7 +341,7 @@ rest pose for saving: `Modes.options.edit.select(); Timeline.setTime(0); Canvas.
 
 ---
 
-## 7. Export texture PNG + animation JSON (no `require`!)
+## 10. Export texture PNG + animation JSON (no `require`!)
 
 ```js
 const tex=Texture.all[0];
