@@ -82,6 +82,7 @@ flat detail from a character grid; `extrude_chain` builds horns, tails, tentacle
 | **`add_hollow_volume`** | A shell with a cavity instead of a solid box | Hoods, helmets, masks, visors, eye sockets, breastplates, pauldrons, bracers, collars, cages, pipes, wheels, crates |
 | **`generate_array`** | Repeats an element along a line / ring / grid | Hems, shingles, scales, feathers, armour plates, teeth, spinal spikes, rivets, fence posts, chain links, ribs |
 | **`extrude_chain`** | A tapering, curving chain, one bone per segment | Horns, antlers, tails, tentacles, claws, tusks, branches, snake bodies, braids, cables, antennae |
+| **`add_wing`** | Arm → forearm → finger fan bones plus a continuous membrane back to the body | Bat, dragon, demon and wyvern wings — anything with skin stretched between bones |
 | **`audit_complexity`** | Measures budget, monoliths, layering, micro-detail, bare faces | The gate before texturing |
 
 Key parameters worth remembering:
@@ -104,6 +105,10 @@ Key parameters worth remembering:
   `create_bones:true` (the default) nests one bone per segment, which is what gives a tail its
   follow-through. Each bone adds `curvature` on top of its parent, so segment *i* sits at
   `base_rotation + i × curvature`. Returns `tip` — the world position where the chain ends.
+- `add_wing {side, base_origin, plane, fingers, arm_length, forearm_length, finger_length, finger_spread}`
+  — never build a membrane from hand-rotated slabs (they leave gaps and z-fight). One call per
+  side with the same numbers; `plane:'horizontal'` is the spread flying pose, `'vertical'` the
+  raised one. Parent it to the chest bone; `generate_animation {type:'fly'}` flaps it.
 
 Use the generators for repetitive mass and `add_cubes` for the shapes only you can judge.
 

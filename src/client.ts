@@ -34,6 +34,7 @@ const HEAVY_ACTIONS = new Set([
   "voxelize_matrix",
   "generate_array",
   "extrude_chain",
+  "add_wing",
   "add_hollow_volume",
   "add_cubes",
   "add_groups",

@@ -7,7 +7,10 @@
  * Blockbench API on the renderer thread and answered with a JSON result.
  *
  * Nothing here is exposed to the public internet: the server binds to 127.0.0.1
- * only. Stop it any time from Tools ▸ MCP Server.
+ * only. Binding alone does not stop a web page in the user's browser from
+ * reaching localhost, so requests carrying an Origin header, a foreign Host
+ * (DNS rebinding) or a non-JSON body are refused — see checkRequest().
+ * Stop it any time from Tools ▸ MCP Server.
  */
 (function () {
 
@@ -1935,8 +1938,8 @@ const DETAILING_GUIDE = [
 	'',
 	'4. THE GENERATORS (all universal — none of them knows what a hood or a scale is):',
 	'   voxelize_matrix    draw the silhouette as rows of characters, get cubes. Blades,',
-	'                      axe heads, bows, horn profiles, shield emblems, fins, wings,',
-	'                      chevrons, gears, plate patterns. Set `palette` per character for',
+	'                      axe heads, bows, horn profiles, shield emblems, fins, feathered',
+	'                      wing profiles, chevrons, gears, plate patterns. Set `palette` per character for',
 	'                      depth / offset_z / name, and merge_adjacent for anything big.',
 	'   add_hollow_volume  a shell with a cavity instead of a solid box. Hoods, helmets,',
 	'                      masks, eye sockets, breastplates, pauldrons, cages, pipes,',
@@ -1946,6 +1949,9 @@ const DETAILING_GUIDE = [
 	'                      Hems, scales, feathers, plates, teeth, spikes, rivets, links.',
 	'   extrude_chain      a tapering, curving chain, one bone per segment by default.',
 	'                      Horns, tails, tentacles, claws, branches, braids, cables.',
+	'   add_wing           a whole bat / dragon wing: arm, forearm, a fan of finger bones and',
+	'                      a CONTINUOUS membrane to the body, parented so it flaps as one.',
+	'                      Never hand-place rotated membrane slabs — they gap and z-fight.',
 	'   Use them for the repetitive mass and add_cubes for the shapes only you can judge.',
 	'',
 	'5. DEPTH DISCIPLINE (this is what makes layers read as layers):',
@@ -2096,7 +2102,7 @@ function detectRig() {
 		kind: 'unknown',
 		root: null, hips: null, spine: [], chest: null, neck: [], head: null, jaw: null,
 		tail: [], ears: [],
-		limbs: { arm: { left: null, right: null }, leg_front: { left: null, right: null }, leg_back: { left: null, right: null } },
+		limbs: { arm: { left: null, right: null }, leg_front: { left: null, right: null }, leg_back: { left: null, right: null }, wing: { left: null, right: null } },
 		unmatched: [],
 	};
 	if (typeof Group === 'undefined' || !Project) return rig;
@@ -2140,6 +2146,9 @@ function detectRig() {
 		const row = limbRow(g.name);
 		let slot;
 		if (role === 'leg') slot = row === 'front' ? 'leg_front' : row === 'back' ? 'leg_back' : 'leg_main';
+		// Wings are their own pair: counting them as arms turned a winged
+		// quadruped's wings into front legs and a bat's wings into its arms.
+		else if (role === 'wing') slot = 'wing';
 		else slot = row === 'front' ? 'arm' : row === 'back' ? 'leg_back' : 'arm';
 		rig.limbs[slot] = rig.limbs[slot] || { left: null, right: null };
 		const entry = {
@@ -2168,6 +2177,7 @@ function detectRig() {
 		? { front: rig.limbs.leg_front || { left: null, right: null }, back: rig.limbs.leg_back || { left: null, right: null } }
 		: { main: rig.limbs.leg_main || rig.limbs.leg_back || { left: null, right: null } };
 	rig.arms = rig.limbs.arm || { left: null, right: null };
+	rig.wings = rig.limbs.wing;
 	rig.torso = rig.chest || rig.spine[rig.spine.length - 1] || rig.hips || null;
 	return rig;
 }
@@ -2190,6 +2200,9 @@ function summarizeRig(rig) {
 		tail: rig.tail.map((g) => g.name),
 		arms: { left: limb(rig.arms.left), right: limb(rig.arms.right) },
 	};
+	if (rig.wings.left || rig.wings.right) {
+		out.wings = { left: limb(rig.wings.left), right: limb(rig.wings.right) };
+	}
 	if (rig.kind === 'quadruped') {
 		out.legs_front = { left: limb(rig.legs.front.left), right: limb(rig.legs.front.right) };
 		out.legs_back = { left: limb(rig.legs.back.left), right: limb(rig.legs.back.right) };
@@ -2844,17 +2857,21 @@ function genFly(rig, frame, opts) {
 	const L = opts.length, power = opts.power;
 	const steps = 4;
 	const at = (p) => (p / steps) * L;
+	const hasWings = !!(rig.wings.left || rig.wings.right);
+	const flyers = hasWings ? rig.wings : rig.arms;
 	for (let p = 0; p <= steps; p++) {
 		const t = at(p);
 		const a = (TAU * p) / steps;
 		const flap = Math.cos(a);
 		['right', 'left'].forEach((side) => {
-			const arm = limbOf(rig.arms, side);
+			const arm = limbOf(flyers, side);
 			if (!arm) return;
 			const s = side === 'right' ? 1 : -1;
 			K.rot(arm.upper, t, [0, 0, s * (34 + flap * 46) * power]);
 			if (arm.lower) K.rot(arm.lower, t, [0, 0, s * flap * 22 * power]);
-			if (arm.end) K.rot(arm.end, t, [0, 0, s * flap * 14 * power]);
+			// A wing's fingers fan out of the forearm; all of them follow through.
+			const tips = hasWings && arm.lower ? childGroups(arm.lower) : (arm.end ? [arm.end] : []);
+			tips.forEach((bone) => K.rot(bone, t, [0, 0, s * flap * 14 * power]));
 		});
 		K.pos(rig.hips || rig.root, t, [0, flap * 0.9 * power, 0]);
 		const chest = rig.chest || rig.spine[rig.spine.length - 1];
@@ -3453,6 +3470,20 @@ const VOXEL_PLANES = {
  * rule as check_model, run over just this batch plus what it was built onto,
  * so the result can warn about itself.
  */
+/**
+ * Cube coordinates are stored before their bones rotate them, so two cubes can
+ * only be compared face-to-face when the same rotated bones carry them. This key
+ * names that chain; cubes under different chains (a wing's fingers, a curled
+ * tail) overlap in stored coordinates without ever touching on screen.
+ */
+function rotatedBoneKey(cube) {
+	const ids = [];
+	for (let g = cube.parent; g && typeof g === 'object' && g.children; g = g.parent) {
+		if (g.rotation && g.rotation.some((r) => Math.abs(r) >= 0.001)) ids.push(g.uuid);
+	}
+	return ids.join('/');
+}
+
 function coplanarPairsAmong(created) {
 	const isFlat = (c) => c.rotation && c.rotation.every((r) => Math.abs(r) < 0.001);
 	const fresh = created.filter(isFlat);
@@ -3472,6 +3503,7 @@ function coplanarPairsAmong(created) {
 			// Only compare each generated pair once; generated-vs-existing always counts.
 			const bi = freshIndex.get(b.uuid);
 			if (bi !== undefined && bi < i) continue;
+			if (rotatedBoneKey(a) !== rotatedBoneKey(b)) continue;
 			for (let ax = 0; ax < 3; ax++) {
 				const o1 = (ax + 1) % 3, o2 = (ax + 2) % 3;
 				if (ov(a.from[o1], a.to[o1], b.from[o1], b.to[o1]) <= 0.1) continue;
@@ -3508,6 +3540,101 @@ function anchorCorner(anchor, point, size) {
 	if (a === 'bottom' || a === 'base') return [point[0] - size[0] / 2, point[1], point[2] - size[2] / 2];
 	if (a === 'center' || a === 'centre') return [point[0] - size[0] / 2, point[1] - size[1] / 2, point[2] - size[2] / 2];
 	throw new Error(`Unknown anchor "${anchor}". Use 'center', 'top', 'bottom' or 'min'.`);
+}
+
+// ---- wings -------------------------------------------------------------------
+// A wing is a fan of straight bones lying in one plane with membrane panels
+// stretched between them. It is laid out in 2D — u = outward from the body,
+// v = across the wing — and only then lifted into the model. Bones carry their
+// rest angle as a rotation about the plane's normal, so every cube stays
+// axis-aligned inside its bone, and each membrane panel is cut from the same
+// 2D polygon as its neighbours: edges meet exactly instead of floating apart.
+
+function rot2(p, deg) {
+	const r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
+	return [p[0] * c - p[1] * s, p[0] * s + p[1] * c];
+}
+const add2 = (a, b) => [a[0] + b[0], a[1] + b[1]];
+const sub2 = (a, b) => [a[0] - b[0], a[1] - b[1]];
+const lerp2 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+
+/** Where a closed 2D polygon crosses the line u = x, as sorted v values. */
+function polygonCrossings(poly, x) {
+	const out = [];
+	for (let i = 0; i < poly.length; i++) {
+		const a = poly[i], b = poly[(i + 1) % poly.length];
+		if ((a[0] <= x && b[0] > x) || (b[0] <= x && a[0] > x)) {
+			out.push(a[1] + ((x - a[0]) / (b[0] - a[0])) * (b[1] - a[1]));
+		}
+	}
+	return out.sort((p, q) => p - q);
+}
+
+/**
+ * Cover a 2D polygon with strips across u, each roughly `step` wide. Every
+ * strip spans the polygon's full extent inside it (sampled at both edges and
+ * at any vertex in between), so the strips never leave a gap on a slanted edge.
+ * `moveCut(u, i, n)` may shift the cut between strip i-1 and i; both strips
+ * follow it, so they still meet exactly.
+ */
+function rasterizePolygon(poly, step, moveCut) {
+	let minU = Infinity, maxU = -Infinity;
+	poly.forEach((p) => { minU = Math.min(minU, p[0]); maxU = Math.max(maxU, p[0]); });
+	const n = Math.max(1, Math.ceil((maxU - minU) / step - 1e-6));
+	const w = (maxU - minU) / n;
+	const cuts = [];
+	for (let i = 0; i <= n; i++) cuts.push(moveCut ? moveCut(minU + i * w, i, n) : minU + i * w);
+	const cells = [];
+	for (let i = 0; i < n; i++) {
+		const u0 = cuts[i], u1 = cuts[i + 1];
+		if (!(u1 > u0)) continue;
+		const xs = [u0 + 1e-4, (u0 + u1) / 2, u1 - 1e-4];
+		poly.forEach((p) => { if (p[0] > u0 && p[0] < u1) xs.push(p[0]); });
+		const spans = [];
+		xs.forEach((x) => {
+			const c = polygonCrossings(poly, x);
+			for (let k = 0; k + 1 < c.length; k += 2) spans.push([c[k], c[k + 1]]);
+		});
+		spans.sort((a, b) => a[0] - b[0]);
+		const merged = [];
+		spans.forEach((s) => {
+			const last = merged[merged.length - 1];
+			// Lobes closer than 0.15 are bridged: the sliver between them would be
+			// invisible, and two cells that close would overlap once edges are nudged.
+			if (last && s[0] <= last[1] + 0.15) last[1] = Math.max(last[1], s[1]);
+			else merged.push(s.slice());
+		});
+		merged.forEach(([v0, v1]) => { if (v1 - v0 > 1e-3) cells.push({ u0, u1, v0, v1 }); });
+	}
+	return cells;
+}
+
+/** Ear-clip a simple 2D polygon into CCW triangles (index triples). */
+function triangulatePolygon(poly) {
+	let area = 0;
+	poly.forEach((p, i) => { const q = poly[(i + 1) % poly.length]; area += p[0] * q[1] - q[0] * p[1]; });
+	const idx = poly.map((_, i) => i);
+	if (area < 0) idx.reverse();
+	const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+	const inside = (p, a, b, c) => cross(a, b, p) >= -1e-9 && cross(b, c, p) >= -1e-9 && cross(c, a, p) >= -1e-9;
+	const tris = [];
+	while (idx.length > 3) {
+		let clipped = false;
+		for (let i = 0; i < idx.length; i++) {
+			const ia = idx[(i + idx.length - 1) % idx.length], ib = idx[i], ic = idx[(i + 1) % idx.length];
+			const a = poly[ia], b = poly[ib], c = poly[ic];
+			if (cross(a, b, c) <= 1e-9) continue;
+			if (idx.some((j) => j !== ia && j !== ib && j !== ic && inside(poly[j], a, b, c))) continue;
+			tris.push([ia, ib, ic]);
+			idx.splice(i, 1);
+			clipped = true;
+			break;
+		}
+		if (!clipped) break;
+	}
+	if (idx.length === 3) tris.push(idx.slice());
+	else for (let i = 1; i + 1 < idx.length; i++) tris.push([idx[0], idx[i], idx[i + 1]]);
+	return tris;
 }
 
 const commands = {
@@ -4371,6 +4498,263 @@ const commands = {
 	},
 
 	/**
+	 * A complete bat / dragon wing: arm -> forearm -> a fan of finger bones, with
+	 * a continuous membrane between the fingers and back to the body. Every
+	 * panel is parented to the bone it rides on, so the wing flaps as one piece.
+	 */
+	add_wing(p) {
+		requireProject();
+		p = p || {};
+		const side = String(p.side || '').toLowerCase();
+		if (side !== 'left' && side !== 'right') {
+			throw new Error('side is required: "left" or "right" — the model\'s own side the wing grows from.');
+		}
+		const base = num3(maybeParse(p.base_origin), null);
+		if (!base) throw new Error('base_origin [x,y,z] is required — the shoulder joint the wing grows from.');
+		const o = orientation();
+		const name = sideNameFor(p.name || 'wing', side);
+		assertSide(name, side, base[o.side_index], 'wing');
+		const parent = resolveParent(p.parent);
+
+		const plane = String(p.plane || 'horizontal').toLowerCase();
+		if (plane !== 'horizontal' && plane !== 'vertical') {
+			throw new Error(`Unknown plane "${p.plane}". Use 'horizontal' (spread flat, sweeping back) or 'vertical' (raised, membrane hanging down).`);
+		}
+		const vertical = plane === 'vertical';
+		// u = outward, v = back (horizontal) or up (vertical), n = the plane's normal.
+		const U = side === 'right' ? o.right_vec : o.left_vec;
+		const V = vertical ? o.up_vec : o.back_vec;
+		const N = vecCross(U, V);
+		const nAxis = N.findIndex((x) => Math.abs(x) > 0.5);
+		const nSign = N[nAxis] > 0 ? 1 : -1;
+		// A rotation of +a about N turns U toward V, so an in-plane angle maps
+		// straight onto one Euler component.
+		const planeRot = (deg) => { const r = [0, 0, 0]; r[nAxis] = R3(nSign * deg); return r; };
+		const lift = (uv, n) => vecAdd(base, vecAdd(vecScale(U, uv[0]), vecAdd(vecScale(V, uv[1]), vecScale(N, n || 0))));
+
+		const fingers = Math.round(numOr(p.fingers, 3));
+		if (!(fingers >= 1 && fingers <= 6)) throw new Error('fingers must be between 1 and 6.');
+		const armLen = numOr(p.arm_length, 8);
+		const foreLen = numOr(p.forearm_length, 10);
+		if (!(armLen > 0 && foreLen > 0)) throw new Error('arm_length and forearm_length must be greater than 0.');
+		const armAngle = numOr(p.arm_angle, vertical ? 35 : 20);
+		const foreAngle = numOr(p.forearm_angle, vertical ? 70 : -15);
+
+		const lenIn = maybeParse(p.finger_length);
+		const fingerLens = [];
+		for (let i = 0; i < fingers; i++) {
+			const t = fingers > 1 ? i / (fingers - 1) : 0;
+			const l = Array.isArray(lenIn) ? Number(lenIn[i]) : numOr(lenIn, 16) * (1 - 0.3 * t);
+			if (!(l > 0)) throw new Error(`finger_length for finger ${i + 1} must be greater than 0.`);
+			fingerLens.push(l);
+		}
+		const angIn = maybeParse(p.finger_angles);
+		const spread = numN(maybeParse(p.finger_spread), 2, vertical ? [100, 10] : [0, 80]);
+		const fingerAngles = [];
+		for (let i = 0; i < fingers; i++) {
+			const t = fingers > 1 ? i / (fingers - 1) : 0;
+			const a = Array.isArray(angIn) ? Number(angIn[i]) : spread[0] + (spread[1] - spread[0]) * t;
+			if (!isFinite(a)) throw new Error(`finger_angles needs a number for finger ${i + 1}.`);
+			fingerAngles.push(a);
+		}
+
+		const boneT = Math.max(0.2, numOr(p.bone_thickness, 2));
+		const memT = Math.max(0.05, numOr(p.membrane_thickness, 0.5));
+		const step = Math.max(0.25, numOr(p.membrane_step, 1));
+		const sag = Math.min(0.6, Math.max(0, numOr(p.membrane_sag, 0.25)));
+		const toBody = p.attach_to_body !== false;
+		let mode = String(p.membrane || 'auto').toLowerCase();
+		if (!['auto', 'cubes', 'mesh', 'none'].includes(mode)) {
+			throw new Error(`Unknown membrane "${p.membrane}". Use 'auto', 'cubes', 'mesh' or 'none'.`);
+		}
+		const meshOk = typeof Mesh !== 'undefined' && !!(Format && Format.meshes);
+		if (mode === 'auto') mode = meshOk ? 'mesh' : 'cubes';
+		if (mode === 'mesh' && !meshOk) {
+			throw new Error('This format does not support meshes. Use membrane:"cubes" (works in every format and animates with the bones).');
+		}
+
+		// ---- 2D layout: the real (rest) pose, and the straight pose the bones rotate.
+		const reach = (from, deg, len) => add2(from, rot2([len, 0], deg));
+		const S = [0, 0];
+		const E = reach(S, armAngle, armLen);
+		const W = reach(E, foreAngle, foreLen);
+		const tips = fingerAngles.map((a, i) => reach(W, a, fingerLens[i]));
+
+		let attach;
+		if (p.membrane_attach !== undefined) {
+			const pt = num3(maybeParse(p.membrane_attach), null);
+			if (!pt) throw new Error('membrane_attach must be an [x,y,z] point on the body.');
+			const d = [pt[0] - base[0], pt[1] - base[1], pt[2] - base[2]];
+			attach = [vecDot(d, U), vecDot(d, V)];
+		} else {
+			attach = [0, (vertical ? -1 : 1) * (armLen + foreLen) * 0.9];
+		}
+
+		const bones = [
+			{ key: 'arm', name: `${name}_arm`, joint: S, rest: [0, 0], angle: armAngle, rel: armAngle, len: armLen, width: boneT },
+			{ key: 'forearm', name: `${name}_forearm`, joint: E, rest: [armLen, 0], angle: foreAngle, rel: foreAngle - armAngle, len: foreLen, width: boneT * 0.8 },
+		];
+		fingerAngles.forEach((a, i) => bones.push({
+			key: 'finger' + i, name: `${name}_finger${i + 1}`, joint: W, rest: [armLen + foreLen, 0],
+			angle: a, rel: a - foreAngle, len: fingerLens[i], width: Math.max(0.3, boneT * 0.5),
+		}));
+		const byKey = {};
+		bones.forEach((b) => (byKey[b.key] = b));
+		/** A real-pose 2D point, expressed in the straight rest pose of bone b. */
+		const toRest = (b, pt) => add2(b.rest, rot2(sub2(pt, b.joint), -b.angle));
+
+		// ---- membrane panels, leading edge to body.
+		const centroid = (pts) => pts.reduce((c, q) => [c[0] + q[0] / pts.length, c[1] + q[1] / pts.length], [0, 0]);
+		const sagPoint = (a, b, pts) => lerp2(lerp2(a, b, 0.5), centroid(pts), sag);
+		const panels = [];
+		for (let i = 0; i + 1 < fingers; i++) {
+			const tri = [W, tips[i], tips[i + 1]];
+			panels.push({ bone: byKey['finger' + i], name: `${name}_membrane${i + 1}`, poly: [W, tips[i], sagPoint(tips[i], tips[i + 1], tri), tips[i + 1]] });
+		}
+		if (toBody) {
+			const last = tips[fingers - 1];
+			const mid = sagPoint(last, attach, [S, E, W, last, attach]);
+			const split = lerp2(mid, attach, 0.5);
+			panels.push({ bone: byKey.forearm, name: `${name}_membrane_forearm`, poly: [E, W, last, mid, split] });
+			panels.push({ bone: byKey.arm, name: `${name}_membrane_arm`, poly: [S, E, split, attach] });
+		}
+
+		// ---- build
+		const restBox = (b, u0, u1, v0, v1, t) => {
+			const a = lift([u0, v0], -t / 2), c = lift([u1, v1], t / 2);
+			return { from: a, to: c, origin: lift(b.rest, 0) };
+		};
+		let cubeCount = bones.length * 2 + 3;
+		if (mode === 'cubes') panels.forEach((pn) => (cubeCount += rasterizePolygon(pn.poly.map((pt) => toRest(pn.bone, pt)), step).length));
+		assertBudget(cubeCount, 'add_wing', p.max_cubes);
+
+		Undo.initEdit({ outliner: true, elements: [] });
+		const cubes = [];
+		const meshes = [];
+		// Rotating about the plane's normal keeps every piece's top and bottom faces
+		// in the same two planes, so wherever pieces overlap (fingers fanning out of
+		// the wrist, a knuckle over a joint) equal thickness would z-fight. Each
+		// piece gets its own thickness, always clear of the membrane.
+		const used = [];
+		const pieceT = (w) => {
+			let t = Math.max(w, memT + 0.5);
+			while (used.some((u) => Math.abs(u - t) < 0.06)) t += 0.06;
+			used.push(t);
+			return t;
+		};
+		// Likewise in the plane: a box edge that lands on the same edge of another
+		// box carried by the same rotations (a finger in line with the forearm, a
+		// strip that ends where a bone piece ends) would share that face. Grow the
+		// edge past it — never shrink, so nothing opens a gap.
+		const frames = new Map();
+		const frameOf = (b) => {
+			const ids = [];
+			for (let g = b.group; g && typeof g === 'object' && g.children; g = g.parent) {
+				if (g.rotation && g.rotation.some((r) => Math.abs(r) >= 0.001)) ids.push(g.uuid);
+			}
+			const key = ids.join('/');
+			if (!frames.has(key)) frames.set(key, []);
+			return frames.get(key);
+		};
+		const place = (b, box, vOnly) => {
+			const others = frameOf(b);
+			const span = (o, a) => Math.min(o[a + '1'], box[a + '1']) - Math.max(o[a + '0'], box[a + '0']) > 0.1;
+			const edges = (vOnly ? [] : [['u0', -1, 'v'], ['u1', 1, 'v']]).concat([['v0', -1, 'u'], ['v1', 1, 'u']]);
+			for (let pass = 0; pass < 8; pass++) {
+				let moved = false;
+				edges.forEach(([e, dir, across]) => {
+					if (others.some((o) => Math.abs(o[e] - box[e]) < 0.03 && span(o, across))) { box[e] += dir * 0.05; moved = true; }
+				});
+				if (!moved) break;
+			}
+			others.push(box);
+			return box;
+		};
+		const addPiece = (b, suffix, u0, u1, halfW) => {
+			const q = place(b, { u0, u1, v0: -halfW, v1: halfW });
+			const box = restBox(b, q.u0, q.u1, q.v0, q.v1, pieceT(q.v1 - q.v0));
+			cubes.push(createCubeIn(b.group, Object.assign({ name: `${b.name}_${suffix}` }, box)));
+		};
+		let holder = parent;
+		bones.forEach((b, i) => {
+			b.group = new Group({ name: b.name, origin: lift(b.rest, 0).map(R3), rotation: planeRot(b.rel) }).init();
+			b.group.addTo(i < 2 ? (holder || 'root') : byKey.forearm.group);
+			if (i < 2) holder = b.group;
+			const r = b.rest[0], w = b.width;
+			// Two tapering pieces. Each end reaches 0.1 past the joint / membrane corner
+			// and the tip starts inside the bone, so no end face lands on another's plane.
+			const cut = r + b.len * 0.6;
+			addPiece(b, 'bone', r - 0.1, cut, w / 2);
+			addPiece(b, 'tip', cut - 0.2, r + b.len + 0.1, w * 0.3);
+		});
+		// Knuckles over shoulder, elbow and wrist hide the wedge a bent joint opens.
+		[[byKey.arm, 0, boneT * 1.35], [byKey.forearm, armLen, boneT * 1.1], [byKey.forearm, armLen + foreLen, boneT * 0.9]]
+			.forEach(([b, at, k], j) => addPiece(b, ['shoulder', 'elbow', 'wrist'][j], at - k / 2, at + k / 2, k / 2));
+
+		const tex = mode === 'mesh' ? (p.texture ? findTexture(p.texture) : (Texture.getDefault ? Texture.getDefault() : Texture.all[0])) : null;
+		panels.forEach((pn, k) => {
+			// Every panel touches the wrist, so any two may overlap there: all distinct.
+			const t = memT + 0.06 * k;
+			const local = pn.poly.map((pt) => toRest(pn.bone, pt));
+			if (mode === 'cubes') {
+				// Strip cuts are chosen now, against everything already in this frame:
+				// a cut on another box's u-face moves, and both strips move with it.
+				const others = frameOf(pn.bone);
+				const moveCut = (u, i, n) => {
+					const dir = i === 0 ? -1 : 1; // the first cut may only grow the panel
+					for (let pass = 0; pass < 8 && others.some((o) => Math.abs(o.u0 - u) < 0.03 || Math.abs(o.u1 - u) < 0.03); pass++) u += dir * 0.05;
+					return u;
+				};
+				const cells = rasterizePolygon(local, step, moveCut);
+				cells.forEach((cell, j) => {
+					const c = place(pn.bone, Object.assign({}, cell), true);
+					cubes.push(createCubeIn(pn.bone.group, Object.assign({ name: `${pn.name}_${j + 1}` }, restBox(pn.bone, c.u0, c.u1, c.v0, c.v1, t))));
+				});
+			} else if (mode === 'mesh') {
+				const origin = lift(pn.bone.rest, 0);
+				const mesh = new Mesh({ name: pn.name, origin: origin.map(R3), rotation: [0, 0, 0] });
+				const keys = local.map((pt) => {
+					const w = lift(pt, 0);
+					return mesh.addVertices([w[0] - origin[0], w[1] - origin[1], w[2] - origin[2]])[0];
+				});
+				// Both windings, so the membrane is visible from above and below.
+				triangulatePolygon(local).forEach((tri) => {
+					[tri, tri.slice().reverse()].forEach((order) => {
+						const f = new MeshFace(mesh, { vertices: order.map((i) => keys[i]) });
+						if (tex) f.texture = tex.uuid;
+						mesh.addFaces(f);
+						setMeshFaceUV(mesh, f, [0, 0, Project.texture_width, Project.texture_height]);
+					});
+				});
+				mesh.init().addTo(pn.bone.group);
+				meshes.push(mesh);
+			}
+		});
+		Undo.finishEdit('MCP: add wing');
+		Canvas.updateAll();
+
+		const res = generatedReport(cubes, {
+			side, plane, membrane: mode,
+			bones: bones.map((b) => ({ name: b.group.name, origin: b.group.origin, rotation: b.group.rotation })),
+			shoulder: base.map(R3),
+			elbow: lift(E, 0).map(R3),
+			wrist: lift(W, 0).map(R3),
+			finger_tips: tips.map((t) => lift(t, 0).map(R3)),
+			membrane_attach: lift(attach, 0).map(R3),
+			membrane_panels: mode === 'none' ? 0 : panels.length,
+			meshes: meshes.map((m) => m.name),
+			parent: parent ? parent.name : 'root',
+		}, 6);
+		res.note = 'The rest pose is baked into the bone rotations: each cube sits straight inside its bone and the membrane panels are cut from one outline, so edges meet exactly. ' +
+			'Animate the bones (generate_animation {type:"fly"} picks up *_arm / *_forearm / *_finger bones). Build the other side with the same call and side flipped — do not mirror_element it.';
+		if (mode === 'cubes') {
+			res.note += ` Membrane strips are ~${R3(step)} wide; lower membrane_step for a smoother trailing edge, raise it for fewer cubes.`;
+		}
+		return reportZFighting(res, cubes,
+			'Move base_origin by >=0.1 so the shoulder joint cube is not flush with the body it grows out of.');
+	},
+
+	/**
 	 * Is this model actually detailed, or 15 boxes wearing a costume?
 	 * Measures cube budget, monolithic masses, layering, micro-detail density
 	 * and bone depth, and returns a verdict you are expected to act on before
@@ -4848,12 +5232,14 @@ const commands = {
 		// coplanar faces point the SAME way, so both render and fight). Fix by
 		// offsetting one cube by >=0.1 (or insetting it) so the faces aren't coplanar.
 		const ortho = Cube.all.filter((c) => c.rotation && c.rotation.every((r) => Math.abs(r) < 0.001));
-		const ov = (a1, a2, b1, b2) => Math.min(a2, b2) - Math.max(a1, b1);
+		const keys = ortho.map(rotatedBoneKey);
+		const ov =(a1, a2, b1, b2) => Math.min(a2, b2) - Math.max(a1, b1);
 		const zEps = 0.02;
 		let zFights = 0;
 		for (let i = 0; i < ortho.length && zFights < 80; i++) {
 			for (let j = i + 1; j < ortho.length && zFights < 80; j++) {
 				const a = ortho[i], b = ortho[j];
+				if (keys[i] !== keys[j]) continue;
 				for (let ax = 0; ax < 3; ax++) {
 					const o1 = (ax + 1) % 3, o2 = (ax + 2) % 3;
 					if (ov(a.from[o1], a.to[o1], b.from[o1], b.to[o1]) <= 0.1) continue;
@@ -6281,6 +6667,10 @@ const commands = {
 
 	// ---- escape hatch -----------------------------------------------------
 	execute_script(p) {
+		if (!scriptsAllowed()) {
+			throw new Error('execute_script is disabled in Blockbench settings ("Allow execute_script"). ' +
+				'Use the dedicated tools, or ask the user to enable it.');
+		}
 		if (!p.code) throw new Error('code is required');
 		const fn = new Function('params', 'Blockbench', '"use strict";\n' + p.code);
 		const result = fn(p.params || {}, Blockbench);
@@ -6341,8 +6731,9 @@ const MAX_BODY = 96 * 1024 * 1024; // 96 MB guard (textures/screenshots can be l
 
 function statusText(code) {
 	return {
-		200: 'OK', 204: 'No Content', 400: 'Bad Request',
-		404: 'Not Found', 405: 'Method Not Allowed', 500: 'Internal Server Error',
+		200: 'OK', 204: 'No Content', 400: 'Bad Request', 403: 'Forbidden',
+		404: 'Not Found', 405: 'Method Not Allowed', 415: 'Unsupported Media Type',
+		500: 'Internal Server Error',
 	}[code] || 'OK';
 }
 
@@ -6354,7 +6745,6 @@ function writeResponse(socket, status, obj, extraHeaders) {
 		`HTTP/1.1 ${status} ${statusText(status)}\r\n` +
 		`Content-Type: application/json\r\n` +
 		`Content-Length: ${body.length}\r\n` +
-		`Access-Control-Allow-Origin: *\r\n` +
 		`Connection: close\r\n`;
 	if (extraHeaders) head += extraHeaders;
 	head += '\r\n';
@@ -6377,17 +6767,41 @@ const LONG_ACTIONS = { request_review: true, ask_user: true, wait_review: true }
  * rather than have the socket die halfway through creating 300 cubes.
  */
 const HEAVY_ACTIONS = {
-	voxelize_matrix: true, generate_array: true, extrude_chain: true, add_hollow_volume: true,
+	voxelize_matrix: true, generate_array: true, extrude_chain: true, add_wing: true, add_hollow_volume: true,
 	add_cubes: true, add_groups: true, audit_complexity: true, detail_cubes: true,
 	paint_faces: true, paint_texture: true, pack_uv: true, create_rig: true, execute_script: true,
 };
 
-async function handleRequest(socket, method, path, body) {
+const LOOPBACK_HOSTS = { '127.0.0.1': true, 'localhost': true, '[::1]': true };
+
+/**
+ * The only legitimate caller is the MCP server process, which uses Node's
+ * fetch: it sends no Origin, addresses the bridge as 127.0.0.1/localhost and
+ * posts JSON. A browser tab always adds Origin to cross-origin POSTs, and a
+ * DNS-rebinding page shows up with its own hostname in Host — so either one
+ * means the request came from a web page, not from the MCP server.
+ * Returns [status, message] for a request to refuse, or null to let it through.
+ */
+function checkRequest(method, headers) {
+	if (headers.origin !== undefined) {
+		return [403, 'Browser requests are not accepted by the BlockbenchMCP bridge'];
+	}
+	const host = String(headers.host || '').toLowerCase().replace(/:\d+$/, '');
+	if (!LOOPBACK_HOSTS[host]) {
+		return [403, 'Host must be 127.0.0.1 or localhost'];
+	}
+	if (method === 'POST' && !/^application\/json\s*(;|$)/i.test(headers['content-type'] || '')) {
+		return [415, 'Content-Type must be application/json'];
+	}
+	return null;
+}
+
+async function handleRequest(socket, method, path, body, headers) {
 	try {
-		if (method === 'OPTIONS') {
-			writeResponse(socket, 204, undefined,
-				'Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n' +
-				'Access-Control-Allow-Headers: Content-Type\r\n');
+		const refusal = checkRequest(method, headers || {});
+		if (refusal) {
+			console.warn('[BlockbenchMCP] refused request:', refusal[1]);
+			writeResponse(socket, refusal[0], { ok: false, error: refusal[1] });
 			return;
 		}
 		if (method === 'GET' && (path === '/' || path === '/ping' || path.startsWith('/ping?'))) {
@@ -6437,6 +6851,7 @@ function handleConnection(socket) {
 	let headersDone = false;
 	let method, path, headerLength, contentLength = 0, expectContinue = false;
 	let dispatched = false;
+	const headers = {};
 
 	socket.on('data', (chunk) => {
 		received += chunk.length;
@@ -6459,6 +6874,7 @@ function handleConnection(socket) {
 				if (c <= 0) continue;
 				const key = lines[i].slice(0, c).trim().toLowerCase();
 				const val = lines[i].slice(c + 1).trim();
+				headers[key] = val;
 				if (key === 'content-length') contentLength = parseInt(val, 10) || 0;
 				if (key === 'expect' && /100-continue/i.test(val)) expectContinue = true;
 			}
@@ -6473,7 +6889,7 @@ function handleConnection(socket) {
 			// completes it, and ignore anything that trails it.
 			dispatched = true;
 			const bodyText = buffer.slice(headerLength, headerLength + contentLength).toString('utf8');
-			handleRequest(socket, method, path, bodyText);
+			handleRequest(socket, method, path, bodyText, headers);
 		}
 	});
 	socket.on('error', () => { try { socket.destroy(); } catch (e) {} });
@@ -6521,6 +6937,11 @@ function stopServer() {
 function getPort() {
 	const setting = settings && settings[PLUGIN_ID + '_port'];
 	return (setting && setting.value) || DEFAULT_PORT;
+}
+
+function scriptsAllowed() {
+	const setting = typeof settings !== 'undefined' && settings && settings[PLUGIN_ID + '_allow_scripts'];
+	return !setting || setting.value !== false;
 }
 
 // ---------------------------------------------------------------------------
@@ -6798,6 +7219,14 @@ function buildUI() {
 		value: true,
 		type: 'toggle',
 	});
+	const allowScriptsSetting = new Setting(PLUGIN_ID + '_allow_scripts', {
+		name: 'Allow execute_script',
+		description: 'Let the connected MCP client run arbitrary JavaScript in Blockbench. ' +
+			'Turn off if you do not fully trust the client or the content it reads (prompt injection).',
+		category: 'general',
+		value: true,
+		type: 'toggle',
+	});
 
 	toggleAction = new Action(PLUGIN_ID + '_toggle', {
 		name: 'Start MCP Server',
@@ -6824,7 +7253,7 @@ function buildUI() {
 		},
 	});
 
-	deletables.push(portSetting, autostartSetting, toggleAction, statusAction);
+	deletables.push(portSetting, autostartSetting, allowScriptsSetting, toggleAction, statusAction);
 
 	try {
 		MenuBar.addAction(toggleAction, 'tools');
@@ -6870,7 +7299,7 @@ Plugin.register(PLUGIN_ID, {
 			'drag in a reference image and the AI builds against it, scoring its silhouette ' +
 			'match so models actually look like the reference instead of "almost".',
 	tags: ['AI', 'Automation', 'MCP'],
-	version: '0.3.0',
+	version: '0.3.1',
 	min_version: '4.8.0',
 	variant: 'desktop',
 	onload() {

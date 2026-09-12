@@ -149,7 +149,7 @@ Point your client at `dist/index.js` over stdio. Use an **absolute path**.
 | **Reference matching** | `get_reference`, `load_reference`, `compare_reference`, `measure_model`, `list_references`, `clear_references` |
 | **Project** | `new_project`, `set_project_meta`, `save_project`, `export_project`, `export_model`, `load_project`, `close_project` |
 | **Geometry** | `add_group`, `add_cube`, `add_groups`, `add_cubes`, `add_plane`, `add_mesh`, `mirror_element`, `edit_element`, `delete_element`, `list_outliner`, `get_element`, `pack_uv` |
-| **Procedural detail** | `voxelize_matrix`, `add_hollow_volume`, `generate_array`, `extrude_chain` |
+| **Procedural detail** | `voxelize_matrix`, `add_hollow_volume`, `generate_array`, `extrude_chain`, `add_wing` |
 | **Quality gates** | `audit_complexity`, `check_model`, `check_sides`, `check_rig` |
 | **Rigging** | `create_rig`, `check_rig`, `get_rig` |
 | **UV & textures** | `create_texture`, `create_vfx_texture`, `paint_texture`, `detail_cubes`, `paint_faces`, `apply_texture`, `set_cube_uv`, `set_texture_render_mode`, `import_texture`, `resize_texture`, `list_textures`, `get_texture` |
@@ -228,7 +228,7 @@ export_project { "path": "D:/models/bear.geo.json" }
 
 ## Example: procedural detail
 
-The same four calls turn a 20-cube blockout into a 150-cube model. None of the tools knows what
+The same few calls turn a 20-cube blockout into a 150-cube model. None of the tools knows what
 a hood or a scale is — they are extrusion, shells, arrays and chains.
 
 ```jsonc
@@ -254,6 +254,14 @@ extrude_chain {
   "segments": 6, "base_origin": [3.5, 32, -1], "segment_length": 2.4,
   "initial_size": [2.4, 2.4], "taper": 0.8, "curvature": [14, 0, -6],
   "direction": "up", "name": "horn", "side": "right", "parent": "head"
+}
+
+// A dragon wing: arm, forearm, 4 finger bones and a continuous membrane back to the body.
+// Repeat with "side": "left" and base_origin x = -3 for the other wing.
+add_wing {
+  "side": "right", "base_origin": [3, 22, 2], "plane": "horizontal",
+  "fingers": 4, "arm_length": 8, "forearm_length": 10, "finger_length": 18,
+  "finger_spread": [0, 85], "parent": "chest"
 }
 
 // A blade: drawn as pixel art in the side plane, extruded into cubes
@@ -287,7 +295,14 @@ Harmless — Blockbench tries to fetch store metadata for the side-loaded plugin
 ## Security
 
 - The bridge binds to **`127.0.0.1` only** — it is not reachable from your network.
-- `execute_script` runs **unsandboxed JavaScript** inside Blockbench. Only connect MCP clients you trust, and prefer the dedicated tools over `execute_script` where possible.
+- Binding to localhost does not stop web pages in your browser from sending requests to it, so the bridge also refuses:
+  - any request with an `Origin` header (browsers always send one on cross-origin requests; the MCP server does not);
+  - any `Host` other than `127.0.0.1` / `localhost` / `[::1]` (blocks DNS rebinding);
+  - `POST` bodies without `Content-Type: application/json`.
+
+  It sends no CORS headers, so a page cannot read its responses either.
+- **Trust boundary: the MCP client.** Anything that controls the connected client — including a model steered by prompt injection from a file, web page or image it reads — can drive every tool.
+- `execute_script` runs **unsandboxed JavaScript** with Blockbench's full privileges. Only connect MCP clients you trust, and prefer the dedicated tools where possible. If you don't need it, turn off **Settings ▸ General ▸ Allow execute_script**. The command is then rejected inside Blockbench and every other tool keeps working.
 
 ## Limitations
 

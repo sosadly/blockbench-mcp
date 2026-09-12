@@ -140,7 +140,8 @@ test("export_model is registered and requires a path", () => {
 test("execute_script documents that an explicit return is required", () => {
   const tool = byName("execute_script");
   assert.match(tool.description, /return/);
-  assert.match(tool.inputSchema.properties.code.description, /explicit `return` is required/);
+  assert.match(tool.inputSchema.properties.code.description, /explicit `return`/);
+  assert.match(tool.inputSchema.properties.code.description, /trailing expression is NOT returned/i);
   assert.match(tool.inputSchema.properties.code.description, /Promise/);
 });
 
@@ -152,6 +153,7 @@ test("every procedural generator is registered with its required inputs", () => 
     add_hollow_volume: ["bounds"],
     generate_array: ["element_size"],
     extrude_chain: ["base_origin"],
+    add_wing: ["side", "base_origin"],
     audit_complexity: [],
   };
   for (const [name, req] of Object.entries(expected)) {
@@ -217,6 +219,22 @@ test("extrude_chain defaults to bones and explains the curvature", () => {
   assert.match(byName("extrude_chain").description, /tip/);
 });
 
+test("add_wing exposes the wing layout and steers away from hand-built membranes", () => {
+  const p = props("add_wing");
+  assert.deepEqual(p.side.enum, ["left", "right"]);
+  assert.deepEqual(p.plane.enum, ["horizontal", "vertical"]);
+  assert.deepEqual(p.membrane.enum, ["auto", "cubes", "mesh", "none"]);
+  for (const key of ["fingers", "arm_length", "forearm_length", "arm_angle", "forearm_angle", "membrane_sag", "membrane_step"]) {
+    assert.equal(p[key].type, "number", `add_wing should expose ${key}`);
+  }
+  assert.equal(p.finger_spread.maxItems, 2);
+  assert.deepEqual(coerceArgs(byName("add_wing").inputSchema, { finger_length: "[18,16,14]" }).finger_length, [18, 16, 14]);
+  const d = byName("add_wing").description;
+  assert.match(d, /membrane/i);
+  assert.match(d, /fly/);
+  assert.match(d, /gaps/);
+});
+
 test("audit_complexity states the cube budgets and its three verdicts", () => {
   const d = byName("audit_complexity").description;
   assert.deepEqual(props("audit_complexity").target.enum, ["auto", "prop", "character", "creature", "hero"]);
@@ -231,7 +249,7 @@ test("audit_complexity states the cube budgets and its three verdicts", () => {
 test("add_cubes points at the budget and the generators instead of 6-8 boxes", () => {
   const d = byName("add_cubes").description;
   assert.match(d, /BUDGET/);
-  for (const tool of ["add_hollow_volume", "generate_array", "extrude_chain", "voxelize_matrix"]) {
+  for (const tool of ["add_hollow_volume", "generate_array", "extrude_chain", "add_wing", "voxelize_matrix"]) {
     assert.ok(d.includes(tool), `add_cubes should hand off to ${tool}`);
   }
 });

@@ -1,6 +1,6 @@
 {
   "name": "blockbench-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "MCP server that lets an AI drive Blockbench: create models, textures, animations, take screenshots, install plugins and more.",
   "type": "module",
   "main": "dist/index.js",

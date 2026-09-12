@@ -25,7 +25,8 @@ const REGISTER = "Plugin.register(PLUGIN_ID, {";
 assert.ok(source.includes(REGISTER), "plugin registration call moved — update this harness");
 const instrumented = source.replace(
   REGISTER,
-  "globalThis.__MCP_COMMANDS__ = commands;\n" + REGISTER
+  "globalThis.__MCP_COMMANDS__ = commands;\n" +
+    "globalThis.__MCP_INTERNALS__ = { detectRig, genFly, rigFrame };\n" + REGISTER
 );
 
 /** A fresh, empty Blockbench-ish world plus the plugin's command table. */
@@ -99,7 +100,7 @@ function loadPlugin(overrides = {}) {
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(instrumented, sandbox, { filename: "blockbench_mcp.js" });
-  return { commands: sandbox.__MCP_COMMANDS__, Cube, Group, sandbox };
+  return { commands: sandbox.__MCP_COMMANDS__, internals: sandbox.__MCP_INTERNALS__, Cube, Group, sandbox };
 }
 
 /**
@@ -124,7 +125,7 @@ function intersects(a, b) {
 test("the harness loads the plugin and exposes every generator", () => {
   const { commands } = loadPlugin();
   for (const name of [
-    "voxelize_matrix", "add_hollow_volume", "generate_array", "extrude_chain", "audit_complexity",
+    "voxelize_matrix", "add_hollow_volume", "generate_array", "extrude_chain", "add_wing", "audit_complexity",
   ]) {
     assert.equal(typeof commands[name], "function", `${name} should be a command`);
   }
@@ -635,6 +636,167 @@ test("a hollow shell and a voxelized matrix are clean by construction", () => {
   assert.equal(shell.z_fight_pairs, undefined);
   const vox = loadPlugin().commands.voxelize_matrix({ matrix: ["####", "#..#", "####"] });
   assert.equal(vox.z_fight_pairs, undefined);
+});
+
+// --- add_wing ---------------------------------------------------------------
+
+/** Stored (rest) coordinates -> where the bones actually put them, and back. */
+function rotMat(deg) {
+  const [x, y, z] = deg.map((d) => (d * Math.PI) / 180);
+  const rx = [[1, 0, 0], [0, Math.cos(x), -Math.sin(x)], [0, Math.sin(x), Math.cos(x)]];
+  const ry = [[Math.cos(y), 0, Math.sin(y)], [0, 1, 0], [-Math.sin(y), 0, Math.cos(y)]];
+  const rz = [[Math.cos(z), -Math.sin(z), 0], [Math.sin(z), Math.cos(z), 0], [0, 0, 1]];
+  const mul = (m, n) => m.map((row, i) => n[0].map((_, j) => row.reduce((s, _v, k) => s + m[i][k] * n[k][j], 0)));
+  return mul(mul(rx, ry), rz);
+}
+const apply = (m, v) => m.map((row) => row[0] * v[0] + row[1] * v[1] + row[2] * v[2]);
+const transpose = (m) => m[0].map((_, i) => m.map((row) => row[i]));
+function bonesAbove(node, Group) {
+  const chain = [];
+  for (let g = node instanceof Group ? node : node.parent; g instanceof Group; g = g.parent) chain.push(g);
+  return chain; // innermost first
+}
+function toWorld(node, pt, Group) {
+  let p = pt.slice();
+  for (const g of bonesAbove(node, Group)) {
+    const d = apply(rotMat(g.rotation), p.map((v, i) => v - g.origin[i]));
+    p = d.map((v, i) => v + g.origin[i]);
+  }
+  return p;
+}
+function toRest(node, pt, Group) {
+  let p = pt.slice();
+  for (const g of bonesAbove(node, Group).reverse()) {
+    const d = apply(transpose(rotMat(g.rotation)), p.map((v, i) => v - g.origin[i]));
+    p = d.map((v, i) => v + g.origin[i]);
+  }
+  return p;
+}
+const near = (a, b, eps = 0.02) => a.every((v, i) => Math.abs(v - b[i]) <= eps);
+const mix = (pts, w) => [0, 1, 2].map((k) => pts.reduce((s, p, i) => s + p[k] * w[i], 0));
+
+test("add_wing builds arm -> forearm -> a finger fan, with membrane riding on its bones", () => {
+  const { commands, Cube, Group } = loadPlugin();
+  const res = commands.add_wing({ side: "right", base_origin: [3, 20, 2], fingers: 3 });
+  const g = (n) => Group.all.find((x) => x.name === n);
+  assert.deepEqual(Group.all.map((x) => x.name), [
+    "wing_right_arm", "wing_right_forearm", "wing_right_finger1", "wing_right_finger2", "wing_right_finger3",
+  ]);
+  assert.equal(g("wing_right_forearm").parent, g("wing_right_arm"));
+  for (let i = 1; i <= 3; i++) assert.equal(g(`wing_right_finger${i}`).parent, g("wing_right_forearm"));
+  assert.equal(res.membrane, "cubes", "no mesh support in this format -> cube membrane");
+  assert.equal(res.membrane_panels, 4);
+  assert.ok(Cube.all.every((c) => c.parent instanceof Group), "nothing floats at the root");
+  const membrane = Cube.all.filter((c) => /membrane/.test(c.name));
+  for (const bone of ["wing_right_finger1", "wing_right_finger2", "wing_right_forearm", "wing_right_arm"]) {
+    assert.ok(membrane.some((c) => c.parent === g(bone)), `a membrane panel should ride on ${bone}`);
+  }
+  assert.equal(res.z_fight_pairs, undefined);
+  assert.equal(commands.check_model().by_type.coplanar_overlap, undefined, "a wing must not z-fight");
+});
+
+test("add_wing's bone rotations put the elbow, wrist and every tip where it reports", () => {
+  const { commands, Cube, Group } = loadPlugin();
+  const res = commands.add_wing({
+    side: "right", base_origin: [3, 20, 2], fingers: 4, finger_length: [18, 16, 14, 12],
+  });
+  const forearm = Group.all.find((x) => x.name === "wing_right_forearm");
+  assert.ok(near(toWorld(forearm, forearm.origin, Group), res.elbow));
+  res.finger_tips.forEach((tip, i) => {
+    const piece = Cube.all.find((c) => c.name === `wing_right_finger${i + 1}_tip`);
+    // The far end of the tip piece, less the 0.1 it reaches past the corner.
+    const end = [piece.to[0] - 0.1, (piece.from[1] + piece.to[1]) / 2, (piece.from[2] + piece.to[2]) / 2];
+    assert.ok(near(toWorld(piece, end, Group), tip), `finger ${i + 1}: ${toWorld(piece, end, Group)} vs ${tip}`);
+    assert.ok(Math.abs(tip[1] - 20) < 1e-6, "a horizontal wing stays in its plane");
+    assert.ok(tip[0] > 3, "the right wing grows toward +X");
+  });
+  assert.ok(res.finger_tips[3][2] > res.finger_tips[0][2] + 5, "the fan sweeps back (+Z)");
+});
+
+test("add_wing's membrane is continuous: no hole between fingers or back to the body", () => {
+  const { commands, Cube, Group } = loadPlugin();
+  const res = commands.add_wing({ side: "right", base_origin: [3, 20, 2], fingers: 3, membrane_step: 0.75 });
+  const membrane = Cube.all.filter((c) => /membrane/.test(c.name));
+  const covered = (world) => membrane.some((c) => {
+    const r = toRest(c, world, Group);
+    return [0, 1, 2].every((k) => r[k] >= c.from[k] - 1e-6 && r[k] <= c.to[k] + 1e-6);
+  });
+  const W = res.wrist, T = res.finger_tips;
+  const weights = [[0.6, 0.2, 0.2], [0.4, 0.55, 0.05], [0.4, 0.05, 0.55], [0.3, 0.35, 0.35], [0.9, 0.05, 0.05]];
+  for (let i = 0; i + 1 < T.length; i++) {
+    for (const w of weights) {
+      const pt = mix([W, T[i], T[i + 1]], w);
+      assert.ok(covered(pt), `gap between finger ${i + 1} and ${i + 2} at ${pt}`);
+    }
+  }
+  const S = res.shoulder, E = res.elbow, A = res.membrane_attach, last = T[T.length - 1];
+  for (const pt of [mix([S, E, A], [1 / 3, 1 / 3, 1 / 3]), mix([E, W, last], [1 / 3, 1 / 3, 1 / 3]),
+    mix([E, A], [0.5, 0.5]), mix([W, A], [0.4, 0.6]), mix([E, last], [0.5, 0.5])]) {
+    assert.ok(covered(pt), `gap in the body membrane at ${pt}`);
+  }
+});
+
+test("add_wing mirrors by side and lays a vertical wing out upward", () => {
+  const left = loadPlugin();
+  const l = left.commands.add_wing({ side: "left", base_origin: [-3, 20, 2] });
+  assert.ok(left.Group.all.every((g) => g.name.startsWith("wing_left")));
+  assert.ok(l.finger_tips.every((t) => t[0] < -3), "the left wing grows toward -X");
+  assert.equal(left.commands.check_model().by_type.coplanar_overlap, undefined);
+
+  const up = loadPlugin();
+  const v = up.commands.add_wing({ side: "right", base_origin: [3, 20, 2], plane: "vertical" });
+  assert.ok(v.finger_tips[0][1] > 30, "the leading finger points up");
+  assert.ok(v.membrane_attach[1] < 20, "the membrane hangs down to the body");
+  assert.ok(v.finger_tips.every((t) => Math.abs(t[2] - 2) < 1e-6), "a vertical wing stays in its plane");
+});
+
+test("add_wing builds a double-sided mesh membrane whose corners are the finger tips", () => {
+  class MeshFace { constructor(mesh, d) { this.vertices = d.vertices; } }
+  class Mesh {
+    constructor(d) { this.name = d.name; this.origin = d.origin; this.rotation = d.rotation; this.vertices = {}; this.faces = {}; this.n = 0; }
+    addVertices(...vs) { return vs.map((v) => { const k = `v${this.n++}`; this.vertices[k] = v; return k; }); }
+    addFaces(...fs) { fs.forEach((f) => { this.faces[`f${Object.keys(this.faces).length}`] = f; }); }
+    init() { return this; }
+    addTo(p) { this.parent = p; p.children.push(this); return this; }
+  }
+  const { commands, Group } = loadPlugin({ Mesh, MeshFace, Format: { id: "free", box_uv: false, meshes: true } });
+  const res = commands.add_wing({ side: "right", base_origin: [3, 20, 2], fingers: 2 });
+  assert.equal(res.membrane, "mesh");
+  assert.equal(res.meshes.length, 3);
+  const panel = Group.all.find((g) => g.name === "wing_right_finger1").children.find((c) => c instanceof Mesh);
+  const corners = Object.values(panel.vertices).map((v) => toWorld(panel, v.map((x, i) => x + panel.origin[i]), Group));
+  for (const tip of res.finger_tips) assert.ok(corners.some((c) => near(c, tip)), `the membrane should reach ${tip}`);
+  assert.ok(corners.every((c) => Math.abs(c[1] - 20) < 0.01));
+  const faces = Object.values(panel.faces);
+  assert.ok(faces.length >= 4 && faces.length % 2 === 0, "each triangle is emitted with both windings");
+});
+
+test("wings get their own rig slot and drive the fly cycle instead of the arms", () => {
+  const { commands, internals } = loadPlugin();
+  commands.add_group({ name: "arm_right", origin: [5, 22, 0] });
+  commands.add_group({ name: "arm_left", origin: [-5, 22, 0] });
+  commands.add_wing({ side: "right", base_origin: [3, 24, 2] });
+  commands.add_wing({ side: "left", base_origin: [-3, 24, 2] });
+  const rig = internals.detectRig();
+  assert.equal(rig.arms.right.upper.name, "arm_right", "a wing must not replace the arm");
+  assert.equal(rig.wings.right.upper.name, "wing_right_arm");
+  assert.equal(rig.wings.left.lower.name, "wing_left_forearm");
+  const animated = new Set(internals.genFly(rig, internals.rigFrame(), { length: 1, power: 1 }).map((k) => k.bone));
+  for (const b of ["wing_right_arm", "wing_right_forearm", "wing_right_finger1", "wing_right_finger3", "wing_left_finger2"]) {
+    assert.ok(animated.has(b), `fly should animate ${b}`);
+  }
+  assert.ok(!animated.has("arm_right"), "the arms are not flapped when there are wings");
+});
+
+test("add_wing rejects bad input with actionable messages", () => {
+  const { commands } = loadPlugin();
+  assert.throws(() => commands.add_wing({ base_origin: [3, 20, 0] }), /side is required/);
+  assert.throws(() => commands.add_wing({ side: "right" }), /base_origin/);
+  assert.throws(() => commands.add_wing({ side: "right", base_origin: [-3, 20, 0] }), /right/i);
+  assert.throws(() => commands.add_wing({ side: "right", base_origin: [3, 20, 0], fingers: 9 }), /fingers/);
+  assert.throws(() => commands.add_wing({ side: "right", base_origin: [3, 20, 0], plane: "diagonal" }), /Unknown plane/);
+  assert.throws(() => commands.add_wing({ side: "right", base_origin: [3, 20, 0], membrane: "mesh" }), /does not support meshes/);
+  assert.throws(() => commands.add_wing({ side: "right", base_origin: [3, 20, 0], parent: "nope" }), /Parent group not found/);
 });
 
 // --- generators integrate with the rest of the plugin ----------------------
