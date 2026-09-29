@@ -1,6 +1,6 @@
 /**
- * Behaviour tests for the bridge's element commands: meshes, and where things
- * end up after they are created.
+ * Behaviour tests for the bridge's element and texture commands: meshes,
+ * batches, and where things end up after they are created.
  *
  * Like plugin-generators.test.js, the plugin runs in a vm context with stubbed
  * Blockbench globals, so these exercise the handlers that actually ship. The
@@ -107,6 +107,35 @@ function loadPlugin(overrides = {}) {
     addTo(parent) { return attach(this, parent); }
   }
 
+  class Texture {
+    static all = [];
+    static getDefault() { return null; }
+    constructor(data = {}) {
+      this.name = data.name;
+      this.width = data.width;
+      this.height = data.height;
+      this.uuid = data.uuid || uuid("t");
+    }
+    fromDataURL(url) { this.source = url; return this; }
+    add() { Texture.all.push(this); return this; }
+    enableParticle() { this.particle = true; }
+  }
+  Texture.all.push(new Texture({ uuid: "t-metal", name: "metal" }));
+
+  /** A canvas that remembers its size and fill in the data URL it hands back. */
+  const document = {
+    createElement() {
+      const canvas = {
+        width: 0,
+        height: 0,
+        fill: null,
+        getContext: () => ({ set fillStyle(v) { canvas.fill = v; }, fillRect() {} }),
+        toDataURL: () => `data:test;${canvas.width}x${canvas.height};${canvas.fill}`,
+      };
+      return canvas;
+    },
+  };
+
   /** Records every edit, so a test can check what Undo was told. */
   const Undo = {
     edits: [],
@@ -129,7 +158,8 @@ function loadPlugin(overrides = {}) {
     Format: { id: "free", box_uv: false, animation_mode: false, meshes: true },
     Formats: {},
     Mode: { selected: { id: "edit" } },
-    Texture: Object.assign([], { all: [{ uuid: "t-metal", name: "metal" }], getDefault: () => null }),
+    Texture,
+    document,
     Animation: { all: [] },
     Undo,
     Canvas: { updateAll() {} },
@@ -143,7 +173,7 @@ function loadPlugin(overrides = {}) {
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(instrumented, sandbox, { filename: "blockbench_mcp.js" });
-  return { commands: sandbox.__MCP_COMMANDS__, Group, Cube, Mesh, Undo, sandbox };
+  return { commands: sandbox.__MCP_COMMANDS__, Group, Cube, Mesh, Texture, Undo, sandbox };
 }
 
 /** Values made inside the vm carry that realm's prototypes; compare them by value. */
@@ -290,4 +320,60 @@ test("add_meshes accepts a JSON-string list or a single spec", () => {
   assert.equal(commands.add_meshes({ meshes: '[{"shape":"plane"},{"shape":"pyramid"}]' }).created, 2);
   assert.equal(commands.add_meshes({ meshes: { shape: "prism" } }).created, 1);
   assert.equal(Mesh.all.length, 3);
+});
+
+// --- create_textures --------------------------------------------------------
+
+test("create_textures makes each solid texture in order, at the project size unless told", async () => {
+  const { commands, Texture } = loadPlugin();
+  const res = await commands.create_textures({
+    textures: [
+      { name: "dark_metal", fill: "#8a8f99" },
+      { name: "glow", fill: "#66ccff", width: 16, height: 32 },
+      // Items are untyped, so a client may send a size as text; it still arrives as a number.
+      { name: "trim", fill: "#ff0000", width: "32", height: "8" },
+    ],
+  });
+  assert.equal(res.created, 3);
+  assert.deepEqual(plain(res.textures.map((t) => t.name)), ["dark_metal", "glow", "trim"]);
+  assert.deepEqual(plain(res.textures.map((t) => [t.width, t.height])), [[64, 64], [16, 32], [32, 8]]);
+  const [darkMetal, glow, trim] = Texture.all.slice(1);
+  assert.equal(darkMetal.source, "data:test;64x64;#8a8f99");
+  assert.equal(glow.source, "data:test;16x32;#66ccff");
+  assert.equal(trim.source, "data:test;32x8;#ff0000");
+  assert.equal(typeof trim.width, "number");
+  assert.equal(typeof trim.height, "number");
+  assert.equal(res.textures[0].uuid, darkMetal.uuid);
+});
+
+test("create_textures refuses a data_url or a bad size before making anything", async () => {
+  const { commands, Texture } = loadPlugin();
+  const ok = { name: "metal", fill: "#888888" };
+  await assert.rejects(
+    commands.create_textures({ textures: [ok, { name: "img", data_url: "data:image/png;base64,AAAA" }] }),
+    /textures\[1\]: create_textures takes solid fills only/
+  );
+  await assert.rejects(
+    commands.create_textures({ textures: [{ width: 5000 }] }),
+    /textures\[0\]\.width must be a whole number 1\.\.4096/
+  );
+  await assert.rejects(
+    commands.create_textures({ textures: [ok, { height: 0 }] }),
+    /textures\[1\]\.height must be a whole number 1\.\.4096/
+  );
+  await assert.rejects(commands.create_textures({ textures: [{ width: "wide" }] }), /width must be a whole number/);
+  await assert.rejects(commands.create_textures({ textures: [ok, { width: 16.5 }] }), /textures\[1\]\.width must be a whole number/);
+  await assert.rejects(commands.create_textures({ textures: [ok, "#ff0000"] }), /textures\[1\] must be an object/);
+  await assert.rejects(commands.create_textures({ textures: [] }), /non-empty array/);
+  await assert.rejects(commands.create_textures({}), /non-empty array/);
+  const tooMany = Array.from({ length: 65 }, (_, i) => ({ name: `t${i}`, fill: "#000000" }));
+  await assert.rejects(commands.create_textures({ textures: tooMany }), /At most 64 textures per call \(got 65\)/);
+  assert.equal(Texture.all.length, 1, "only the texture the world started with");
+});
+
+test("create_textures accepts a JSON-string list", async () => {
+  const { commands, Texture } = loadPlugin();
+  const res = await commands.create_textures({ textures: '[{"name":"a","fill":"#111111"},{"name":"b"}]' });
+  assert.equal(res.created, 2);
+  assert.equal(Texture.all.length, 3);
 });

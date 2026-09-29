@@ -512,6 +512,11 @@ function blankTextureDataURL(width, height, fill) {
 	return c.toDataURL('image/png');
 }
 
+// create_textures makes a model's material set, not an atlas: cap how many and
+// how big, so one malformed call can't ask Blockbench for an enormous canvas.
+const MAX_TEXTURE_BATCH = 64;
+const MAX_TEXTURE_SIDE = 4096;
+
 // --- colour helpers ---------------------------------------------------------
 let _colorCanvas = null;
 /** Parse any CSS colour ('#abc', 'rgb(...)', 'red', ...) into {r,g,b,a}. */
@@ -5406,6 +5411,34 @@ const commands = {
 		});
 	},
 
+	// Several solid-colour textures in one call (a model's material set). Solid
+	// fills only: an item never takes a data_url, so a batch can't load an image.
+	// Everything is checked before the first texture is made.
+	async create_textures(p) {
+		requireProject();
+		const list = toList(p.textures);
+		if (!list.length) throw new Error('`textures` must be a non-empty array of {name, fill, width?, height?}.');
+		if (list.length > MAX_TEXTURE_BATCH) throw new Error(`At most ${MAX_TEXTURE_BATCH} textures per call (got ${list.length}).`);
+		// The items are untyped objects, so nothing on the way here turned '32'
+		// into 32: check the number and forward it, or tex.width ends up a string.
+		const side = (v) => (v === undefined ? undefined : Number(v));
+		list.forEach((t, i) => {
+			if (!t || typeof t !== 'object' || Array.isArray(t)) throw new Error(`textures[${i}] must be an object.`);
+			if (t.data_url !== undefined) throw new Error(`textures[${i}]: create_textures takes solid fills only; use create_texture for a data_url.`);
+			for (const key of ['width', 'height']) {
+				const n = side(t[key]);
+				if (n !== undefined && !(Number.isInteger(n) && n >= 1 && n <= MAX_TEXTURE_SIDE)) {
+					throw new Error(`textures[${i}].${key} must be a whole number 1..${MAX_TEXTURE_SIDE} (got ${t[key]}).`);
+				}
+			}
+		});
+		const out = [];
+		for (const t of list) {
+			out.push(await commands.create_texture({ name: t.name, width: side(t.width), height: side(t.height), fill: t.fill }));
+		}
+		return { created: out.length, textures: out };
+	},
+
 	// Generate a pixelated VFX texture: a bright hot core fading to cool edges in
 	// quantized colour bands with jagged transparent edges. `style` picks the
 	// shape (flame, energy, orb, spark, smoke, trail, beam, bolt, ring,
@@ -6836,7 +6869,7 @@ const LONG_ACTIONS = { request_review: true, ask_user: true, wait_review: true }
 const HEAVY_ACTIONS = {
 	voxelize_matrix: true, generate_array: true, extrude_chain: true, add_wing: true, add_hollow_volume: true,
 	add_cubes: true, add_meshes: true, add_groups: true, audit_complexity: true, detail_cubes: true,
-	paint_faces: true, paint_texture: true, pack_uv: true, create_rig: true, execute_script: true,
+	paint_faces: true, paint_texture: true, create_textures: true, pack_uv: true, create_rig: true, execute_script: true,
 };
 
 const LOOPBACK_HOSTS = { '127.0.0.1': true, 'localhost': true, '[::1]': true };

@@ -38,6 +38,7 @@ const HEAVY_ACTIONS = new Set([
   "add_hollow_volume",
   "add_cubes",
   "add_meshes",
+  "create_textures",
   "add_groups",
   "audit_complexity",
   "detail_cubes",

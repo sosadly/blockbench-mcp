@@ -239,8 +239,9 @@ the result ("close enough"). Use the reference engine so the match is a measured
 - Rig: `create_rig` (humanoid/quadruped, segmented), `check_rig`, `get_rig`.
 - Quality gates: **`audit_complexity`** (density + monoliths + layering), `check_model`
   (z-fighting, untextured faces, UVs), `check_sides`, `check_rig`.
-- Texture: `pack_uv`, `create_texture`, `detail_cubes`, `paint_faces`, `paint_texture`,
-  `get_texture`, `apply_texture`, `create_vfx_texture`, `set_texture_render_mode`.
+- Texture: `pack_uv`, `create_texture`, `create_textures` (bulk), `detail_cubes`,
+  `paint_faces`, `paint_texture`, `get_texture`, `apply_texture`, `create_vfx_texture`,
+  `set_texture_render_mode`.
 - Review: `screenshot`, `screenshot_views`, **`request_review`**, **`ask_user`**.
 - Animate: `generate_animation`, `analyze_animation`, `preview_animation`, `create_animation`,
   `add_keyframes`, `list_animations`.

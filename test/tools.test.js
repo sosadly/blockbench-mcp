@@ -277,6 +277,19 @@ test("add_meshes takes a list of add_mesh specs and states its limits", () => {
   assert.deepEqual(one.meshes, [{ shape: "gem" }]);
 });
 
+// --- textures ---------------------------------------------------------------
+
+test("create_textures takes a list of solid fills and says it refuses a data_url", () => {
+  assert.deepEqual(required("create_textures"), ["textures"]);
+  const textures = props("create_textures").textures;
+  assert.equal(textures.type, "array");
+  assert.equal(textures.items.type, "object");
+  const d = byName("create_textures").description;
+  assert.match(d, /data_url is refused/);
+  assert.match(d, /64/);
+  assert.match(d, /4096/);
+});
+
 // --- argument coercion (clients serialize arrays differently) ---------------
 
 test("coerceArgs parses JSON text into the arrays and objects a schema wants", () => {

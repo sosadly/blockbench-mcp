@@ -20,7 +20,7 @@
 
 **Blockbench MCP** is an open-source [Model Context Protocol](https://modelcontextprotocol.io/) server that connects AI assistants such as **Claude Code, Claude Desktop and Cursor** to the live [Blockbench](https://www.blockbench.net/) desktop editor. The AI can create **Minecraft Java, Bedrock and [GeckoLib](https://github.com/bernie-g/geckolib) models**, paint textures pixel by pixel, build rigs, write keyframe animations, install Blockbench plugins and take screenshots to check its own work. You don't have to touch the editor.
 
-It has **71 MCP tools** over one local connection. They cover blockout, detailing, texturing, rigging, animation and export, with quality gates between the stages so a model ends up with real detail instead of 15 flat boxes.
+It has **72 MCP tools** over one local connection. They cover blockout, detailing, texturing, rigging, animation and export, with quality gates between the stages so a model ends up with real detail instead of 15 flat boxes.
 
 ## Gallery
 
@@ -179,7 +179,7 @@ Point your client at `dist/index.js` over stdio, using an **absolute path**.
 | **Procedural detail** | `voxelize_matrix`, `add_hollow_volume`, `generate_array`, `extrude_chain`, `add_wing` |
 | **Quality gates** | `audit_complexity`, `check_model`, `check_sides`, `check_rig` |
 | **Rigging** | `create_rig`, `check_rig`, `get_rig` |
-| **UV & textures** | `create_texture`, `create_vfx_texture`, `paint_texture`, `detail_cubes`, `paint_faces`, `apply_texture`, `set_cube_uv`, `set_texture_render_mode`, `import_texture`, `resize_texture`, `list_textures`, `get_texture` |
+| **UV & textures** | `create_texture`, `create_textures`, `create_vfx_texture`, `paint_texture`, `detail_cubes`, `paint_faces`, `apply_texture`, `set_cube_uv`, `set_texture_render_mode`, `import_texture`, `resize_texture`, `list_textures`, `get_texture` |
 | **Animation** | `generate_animation`, `analyze_animation`, `preview_animation`, `create_animation`, `add_keyframe`, `add_keyframes`, `list_animations`, `remove_animation` |
 | **View** | `set_camera_angle`, `screenshot`, `screenshot_views` |
 | **Plugins** | `list_plugins`, `install_plugin`, `uninstall_plugin` |

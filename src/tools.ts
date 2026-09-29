@@ -847,6 +847,20 @@ const catalogue: ToolDef[] = [
     })
   ),
   forward(
+    "create_textures",
+    "Create several solid-colour textures in one call — a model's whole material set (e.g. metal, dark_metal, glow) at once. Pass `textures`: an array of {name, fill, width?, height?}; width/height default to the project texture size. Solid fills only — an item carrying a data_url is refused (use create_texture for that). Every item is checked before any texture is made. At most 64 per call, each side a whole number of at most 4096. Returns each texture's uuid.",
+    obj(
+      {
+        textures: {
+          type: "array",
+          description: "Array of {name, fill:'#rrggbb', width?, height?}.",
+          items: { type: "object" },
+        },
+      },
+      ["textures"]
+    )
+  ),
+  forward(
     "create_vfx_texture",
     "Generate a pixelated VFX texture: a bright hot core fading to cool edges in quantized colour bands with jagged transparent edges — the look of pixel flames/energy/projectiles. With frames>1 it bakes a vertical FLIPBOOK and starts the animation player so the effect loops. Defaults to an additive/emissive render mode + 2-sided rendering so it glows on a plane. Apply it to add_plane planes (crossed/layered) and animate with bones. See get_guide topic 'vfx'.",
     obj({
