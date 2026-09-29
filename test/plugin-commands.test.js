@@ -1,6 +1,6 @@
 /**
- * Behaviour tests for the bridge's element and texture commands: meshes,
- * batches, and where things end up after they are created.
+ * Behaviour tests for the bridge's element, texture and camera commands:
+ * meshes, batches, and where things end up after they are created.
  *
  * Like plugin-generators.test.js, the plugin runs in a vm context with stubbed
  * Blockbench globals, so these exercise the handlers that actually ship. The
@@ -604,4 +604,29 @@ test("an empty mesh reports null bounds rather than infinities", () => {
   const { commands, Mesh } = loadPlugin();
   new Mesh({ name: "empty", vertices: {} }).init();
   assert.equal(commands.get_element({ element: "empty" }).bounds, null);
+});
+
+// --- set_camera_angle -------------------------------------------------------
+
+/** A preview that records every projection switch. */
+function fakePreview() {
+  const calls = [];
+  const vec = () => ({ v: [0, 0, 0], set(x, y, z) { this.v = [x, y, z]; }, toArray() { return this.v.slice(); } });
+  return {
+    calls,
+    setProjectionMode(ortho) { calls.push(ortho); },
+    camera: { position: vec() },
+    controls: { target: vec() },
+    render() {},
+  };
+}
+
+test("set_camera_angle switches to orthographic and back to perspective", () => {
+  const preview = fakePreview();
+  const { commands } = loadPlugin({ Preview: { selected: preview } });
+  commands.set_camera_angle({ angle: "ortho" });
+  commands.set_camera_angle({ angle: "perspective", position: [0, 20, -40] });
+  commands.set_camera_angle({ position: [1, 2, 3] });
+  assert.deepEqual(preview.calls, [true, false], "only an explicit angle changes the projection");
+  assert.deepEqual(preview.camera.position.toArray(), [1, 2, 3]);
 });

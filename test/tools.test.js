@@ -312,6 +312,12 @@ test("create_textures takes a list of solid fills and says it refuses a data_url
   assert.match(d, /4096/);
 });
 
+// --- view -------------------------------------------------------------------
+
+test("set_camera_angle can switch to orthographic and back", () => {
+  assert.deepEqual(props("set_camera_angle").angle.enum, ["ortho", "perspective"]);
+});
+
 // --- argument coercion (clients serialize arrays differently) ---------------
 
 test("coerceArgs parses JSON text into the arrays and objects a schema wants", () => {

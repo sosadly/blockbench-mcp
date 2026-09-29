@@ -6340,6 +6340,10 @@ const commands = {
 		if (p.angle && typeof preview.setProjectionMode === 'function' && p.angle === 'ortho') {
 			preview.setProjectionMode(true);
 		}
+		// Without this, 'ortho' was a one-way switch: nothing turned perspective back on.
+		if (p.angle && typeof preview.setProjectionMode === 'function' && p.angle === 'perspective') {
+			preview.setProjectionMode(false);
+		}
 		if (Array.isArray(p.position)) preview.camera.position.set(p.position[0], p.position[1], p.position[2]);
 		if (Array.isArray(p.target) && preview.controls) preview.controls.target.set(p.target[0], p.target[1], p.target[2]);
 		if (p.preset && preview.loadAnglePreset && DefaultCameraPresets) {

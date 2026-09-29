@@ -1155,7 +1155,7 @@ const catalogue: ToolDef[] = [
       preset: { type: "string", description: "A camera angle preset id (e.g. 'front', 'isometric_right_front')." },
       position: vec3("Explicit camera position [x,y,z]."),
       target: vec3("Look-at target [x,y,z]."),
-      angle: { type: "string", description: "'ortho' to switch to orthographic projection." },
+      angle: { type: "string", enum: ["ortho", "perspective"], description: "'ortho' switches to orthographic projection, 'perspective' back again." },
     })
   ),
   {
