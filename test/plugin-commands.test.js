@@ -212,3 +212,82 @@ test("add_mesh refuses a format without meshes", () => {
   const { commands } = loadPlugin({ Format: { id: "java_block", box_uv: false, meshes: false } });
   assert.throws(() => commands.add_mesh({}), /does not support meshes/);
 });
+
+// --- add_meshes -------------------------------------------------------------
+
+test("add_meshes builds every mesh in one undo step, each where its spec says", () => {
+  const { commands, Mesh, Group, Undo } = loadPlugin();
+  commands.add_group({ name: "crown" });
+  const res = commands.add_meshes({
+    meshes: [
+      { name: "gem_a", shape: "gem", from: [0, 10, 0], size: [2, 3, 2], parent: "crown" },
+      { name: "spike", shape: "cone", segments: 5, from: [-4, 0, -4], size: [2, 6, 2], texture: "metal" },
+      { name: "blade", shape: "wedge", from: [5, 1, 1], size: [1, 8, 2], origin: [0, 0, 0] },
+    ],
+  });
+  assert.equal(res.created, 3);
+  assert.deepEqual(plain(res.meshes.map((m) => m.name)), ["gem_a", "spike", "blade"]);
+  assert.deepEqual(plain(res.meshes.map((m) => m.shape)), ["gem", "cone", "wedge"]);
+  assert.equal(Mesh.all.length, 3);
+  assert.equal(Mesh.all[0].parent, Group.all[0], "parented into the named group");
+
+  assert.deepEqual(worldBounds(Mesh.all[0]), { from: [0, 10, 0], to: [2, 13, 2] });
+  assert.deepEqual(worldBounds(Mesh.all[2]), { from: [5, 1, 1], to: [6, 9, 3] });
+  // A cone's ring never reaches every corner, but its apex and base do reach the box's top and bottom.
+  const spike = worldBounds(Mesh.all[1]);
+  assert.equal(spike.from[1], 0);
+  assert.equal(spike.to[1], 6);
+  assert.equal(Object.keys(Mesh.all[1].vertices).length, 5 + 2, "5 ring vertices, an apex and a centre");
+
+  const meshEdits = Undo.edits.filter((e) => e.message === "MCP: add meshes");
+  assert.equal(meshEdits.length, 1, "one undo step for the whole batch");
+  assert.equal(meshEdits[0].after.elements.length, 3);
+  assert.ok(Mesh.all.every((m) => meshEdits[0].after.elements.includes(m)));
+});
+
+test("add_meshes checks every item before creating any of them", () => {
+  const { commands, Mesh, Undo } = loadPlugin();
+  const good = { shape: "crystal" };
+  assert.throws(
+    () => commands.add_meshes({ meshes: [good, { parent: "nope" }, good] }),
+    /meshes\[1\]: Parent group not found: nope/
+  );
+  assert.throws(() => commands.add_meshes({ meshes: [good, good, { texture: "nope" }] }), /meshes\[2\]: Texture not found/);
+  assert.throws(() => commands.add_meshes({ meshes: [{ shape: "blob" }] }), /meshes\[0\]: Unknown mesh shape/);
+  assert.throws(() => commands.add_meshes({ meshes: [good, "crystal"] }), /meshes\[1\] must be an object/);
+  assert.throws(() => commands.add_meshes({ meshes: [good, [1, 2, 3]] }), /meshes\[1\] must be an object/);
+  assert.equal(Mesh.all.length, 0, "nothing is built when any item is bad");
+  assert.equal(Undo.edits.length, 0, "and no edit is opened");
+});
+
+test("add_meshes caps the batch size and the segment count, and wants a whole number of segments", () => {
+  const { commands, Mesh, Undo } = loadPlugin();
+  assert.throws(() => commands.add_meshes({}), /non-empty array/);
+  assert.throws(() => commands.add_meshes({ meshes: [] }), /non-empty array/);
+  const tooMany = Array.from({ length: 201 }, () => ({ shape: "plane" }));
+  assert.throws(() => commands.add_meshes({ meshes: tooMany }), /At most 200 meshes per call \(got 201\)/);
+  assert.throws(
+    () => commands.add_meshes({ meshes: [{ shape: "cylinder", segments: 129 }] }),
+    /meshes\[0\]: segments must be a whole number, at most 128/
+  );
+  assert.throws(() => commands.add_mesh({ shape: "cylinder", segments: 5000 }), /segments must be a whole number, at most 128/);
+  assert.throws(() => commands.add_mesh({ shape: "cone", segments: "lots" }), /segments must be a whole number, at most 128/);
+  // A fractional count used to fail half-way through building, after the first mesh was made.
+  assert.throws(
+    () => commands.add_meshes({ meshes: [{ shape: "crystal" }, { shape: "cone", segments: 3.5 }] }),
+    /meshes\[1\]: segments must be a whole number/
+  );
+  assert.throws(() => commands.add_mesh({ shape: "cylinder", segments: 6.5 }), /segments must be a whole number/);
+  assert.equal(Mesh.all.length, 0);
+  assert.equal(Undo.edits.length, 0, "no edit is opened for a refused count");
+
+  assert.equal(commands.add_meshes({ meshes: Array.from({ length: 200 }, () => ({ shape: "plane" })) }).created, 200);
+  assert.equal(commands.add_mesh({ shape: "cylinder", segments: 128 }).vertices, 2 * 128 + 2);
+});
+
+test("add_meshes accepts a JSON-string list or a single spec", () => {
+  const { commands, Mesh } = loadPlugin();
+  assert.equal(commands.add_meshes({ meshes: '[{"shape":"plane"},{"shape":"pyramid"}]' }).created, 2);
+  assert.equal(commands.add_meshes({ meshes: { shape: "prism" } }).created, 1);
+  assert.equal(Mesh.all.length, 3);
+});

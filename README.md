@@ -20,7 +20,7 @@
 
 **Blockbench MCP** is an open-source [Model Context Protocol](https://modelcontextprotocol.io/) server that connects AI assistants such as **Claude Code, Claude Desktop and Cursor** to the live [Blockbench](https://www.blockbench.net/) desktop editor. The AI can create **Minecraft Java, Bedrock and [GeckoLib](https://github.com/bernie-g/geckolib) models**, paint textures pixel by pixel, build rigs, write keyframe animations, install Blockbench plugins and take screenshots to check its own work. You don't have to touch the editor.
 
-It has **70 MCP tools** over one local connection. They cover blockout, detailing, texturing, rigging, animation and export, with quality gates between the stages so a model ends up with real detail instead of 15 flat boxes.
+It has **71 MCP tools** over one local connection. They cover blockout, detailing, texturing, rigging, animation and export, with quality gates between the stages so a model ends up with real detail instead of 15 flat boxes.
 
 ## Gallery
 
@@ -175,7 +175,7 @@ Point your client at `dist/index.js` over stdio, using an **absolute path**.
 | **Human review** | `request_review`, `ask_user` |
 | **Reference matching** | `get_reference`, `load_reference`, `compare_reference`, `measure_model`, `list_references`, `clear_references` |
 | **Project** | `new_project`, `set_project_meta`, `save_project`, `export_project`, `export_model`, `load_project`, `close_project` |
-| **Geometry** | `add_group`, `add_cube`, `add_groups`, `add_cubes`, `add_plane`, `add_mesh`, `mirror_element`, `edit_element`, `delete_element`, `list_outliner`, `get_element`, `pack_uv` |
+| **Geometry** | `add_group`, `add_cube`, `add_groups`, `add_cubes`, `add_plane`, `add_mesh`, `add_meshes`, `mirror_element`, `edit_element`, `delete_element`, `list_outliner`, `get_element`, `pack_uv` |
 | **Procedural detail** | `voxelize_matrix`, `add_hollow_volume`, `generate_array`, `extrude_chain`, `add_wing` |
 | **Quality gates** | `audit_complexity`, `check_model`, `check_sides`, `check_rig` |
 | **Rigging** | `create_rig`, `check_rig`, `get_rig` |

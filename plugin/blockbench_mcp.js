@@ -1531,6 +1531,11 @@ function setMeshFaceUV(mesh, face, rect) {
 //     the rotation pivot; it never moves the shape.
 // ---------------------------------------------------------------------------
 
+// add_meshes builds every spec's geometry before creating any of it, so these
+// keep one call from freezing Blockbench many times over.
+const MAX_MESH_BATCH = 200;
+const MAX_MESH_SEGMENTS = 128;
+
 function requireMeshFormat() {
 	if (typeof Mesh === 'undefined') throw new Error('Meshes are not available in this Blockbench build.');
 	if (Format && Format.meshes === false) throw new Error('Current format does not support meshes. Use a free/generic project, or build the shape from rotated cubes.');
@@ -1546,7 +1551,13 @@ function resolveMeshSpec(p) {
 	const size = num3(p.size, [8, 8, 8]);
 	const from = num3(p.from, [-size[0] / 2, 0, -size[2] / 2]);
 	const origin = num3(p.origin, [from[0] + size[0] / 2, from[1] + size[1] / 2, from[2] + size[2] / 2]);
-	const prim = meshPrimitive(shape, size[0], size[1], size[2], p.segments);
+	// A fractional count makes meshPrimitive emit fractional ring indices, which
+	// only fail once the mesh is half built, so refuse it here with the rest.
+	const segments = p.segments === undefined ? undefined : Number(p.segments);
+	if (segments !== undefined && !(Number.isInteger(segments) && segments <= MAX_MESH_SEGMENTS)) {
+		throw new Error(`segments must be a whole number, at most ${MAX_MESH_SEGMENTS} (got ${p.segments}).`);
+	}
+	const prim = meshPrimitive(shape, size[0], size[1], size[2], segments);
 	const uvRect = Array.isArray(p.uv) ? p.uv : [0, 0, Project.texture_width, Project.texture_height];
 	return { name: p.name || shape, shape, from, origin, rotation: num3(p.rotation, [0, 0, 0]), prim, tex, uvRect, parent };
 }
@@ -5144,6 +5155,26 @@ const commands = {
 		return serializeMesh(mesh, spec.shape);
 	},
 
+	// Many meshes in one call — the mesh counterpart of add_cubes. Every spec is
+	// resolved (parent, texture, shape) before anything is created, so one bad
+	// entry fails the whole batch instead of leaving half of it built.
+	add_meshes(p) {
+		requireProject();
+		requireMeshFormat();
+		const list = toList(p.meshes);
+		if (!list.length) throw new Error('`meshes` must be a non-empty array of add_mesh specs.');
+		if (list.length > MAX_MESH_BATCH) throw new Error(`At most ${MAX_MESH_BATCH} meshes per call (got ${list.length}).`);
+		const specs = list.map((m, i) => {
+			if (!m || typeof m !== 'object' || Array.isArray(m)) throw new Error(`meshes[${i}] must be an object (an add_mesh spec).`);
+			try { return resolveMeshSpec(m); } catch (e) { throw new Error(`meshes[${i}]: ${e.message}`); }
+		});
+		Undo.initEdit({ outliner: true, elements: [] });
+		const created = specs.map(createMesh);
+		Undo.finishEdit('MCP: add meshes', { outliner: true, elements: created });
+		Canvas.updateAll();
+		return { created: created.length, meshes: created.map((m, i) => serializeMesh(m, specs[i].shape)) };
+	},
+
 	// Mirror a cube or group across an axis about a pivot (default x=0) — build
 	// one side, then mirror it for perfect symmetry. Returns the clones.
 	mirror_element(p) {
@@ -6804,7 +6835,7 @@ const LONG_ACTIONS = { request_review: true, ask_user: true, wait_review: true }
  */
 const HEAVY_ACTIONS = {
 	voxelize_matrix: true, generate_array: true, extrude_chain: true, add_wing: true, add_hollow_volume: true,
-	add_cubes: true, add_groups: true, audit_complexity: true, detail_cubes: true,
+	add_cubes: true, add_meshes: true, add_groups: true, audit_complexity: true, detail_cubes: true,
 	paint_faces: true, paint_texture: true, pack_uv: true, create_rig: true, execute_script: true,
 };
 

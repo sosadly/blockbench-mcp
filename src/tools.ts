@@ -743,11 +743,25 @@ const catalogue: ToolDef[] = [
         from: vec3("Lower corner of the bounding box: the shape always spans from..from+size (defaults to centred on x/z at y=0)."),
         origin: vec3("Rotation pivot only — it does not move the shape (defaults to the shape centre)."),
         rotation: vec3("Rotation in degrees [x,y,z], about `origin`."),
-        segments: { type: "number", description: "Radial segments for cone/cylinder (default 8)." },
+        segments: { type: "number", description: "Radial segments for cone/cylinder: a whole number (default 8, at most 128)." },
         texture: { type: "string", description: "Texture to apply (defaults to the project default). An unknown name is an error." },
         uv: { type: "array", items: { type: "number" }, description: "UV rect [x1,y1,x2,y2] every face maps into (defaults to the whole texture)." },
         parent: { type: "string", description: "uuid or name of the parent bone/group." },
       }
+    )
+  ),
+  forward(
+    "add_meshes",
+    "Create many MESH primitives in one call — the mesh counterpart of add_cubes, and much faster than one add_mesh per part. Pass `meshes`: an array where each item takes the same fields as add_mesh ({name, shape, size, from, origin, rotation, segments, texture, uv, parent}); each shape spans exactly from..from+size, and `origin` is only its pivot. Every item is checked (parent, texture, shape) before anything is created, so one bad item fails the whole call instead of leaving half of it built. At most 200 per call, segments at most 128. Returns each mesh with its uuid.",
+    obj(
+      {
+        meshes: {
+          type: "array",
+          description: "Array of mesh specs (each like add_mesh's args).",
+          items: { type: "object" },
+        },
+      },
+      ["meshes"]
     )
   ),
   forward(

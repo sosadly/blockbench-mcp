@@ -263,6 +263,20 @@ test("add_mesh says where the shape lands and that origin is only the pivot", ()
   assert.match(p.texture.description, /unknown name is an error/i);
 });
 
+test("add_meshes takes a list of add_mesh specs and states its limits", () => {
+  assert.deepEqual(required("add_meshes"), ["meshes"]);
+  const meshes = props("add_meshes").meshes;
+  assert.equal(meshes.type, "array");
+  assert.equal(meshes.items.type, "object");
+  const d = byName("add_meshes").description;
+  assert.match(d, /add_mesh/);
+  assert.match(d, /before anything is created/);
+  assert.match(d, /200/);
+  // A client that sends one spec instead of a list still gets a list through.
+  const one = coerceArgs(byName("add_meshes").inputSchema, { meshes: { shape: "gem" } });
+  assert.deepEqual(one.meshes, [{ shape: "gem" }]);
+});
+
 // --- argument coercion (clients serialize arrays differently) ---------------
 
 test("coerceArgs parses JSON text into the arrays and objects a schema wants", () => {
