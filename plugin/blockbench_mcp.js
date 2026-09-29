@@ -1522,6 +1522,60 @@ function setMeshFaceUV(mesh, face, rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Mesh creation. Two facts about Blockbench's Mesh decide how this is written:
+//   * its constructor seeds a default 4x4x4 cube (8 vertices, 6 faces) whenever
+//     `data.vertices` is missing, so a mesh built vertex by vertex has to start
+//     from `vertices: {}` or it carries that cube next to its real shape;
+//   * vertices are stored RELATIVE to the mesh's origin, so a shape meant to
+//     span from..from+size is written at from + v - origin. The origin is only
+//     the rotation pivot; it never moves the shape.
+// ---------------------------------------------------------------------------
+
+function requireMeshFormat() {
+	if (typeof Mesh === 'undefined') throw new Error('Meshes are not available in this Blockbench build.');
+	if (Format && Format.meshes === false) throw new Error('Current format does not support meshes. Use a free/generic project, or build the shape from rotated cubes.');
+}
+
+/** Resolve an add_mesh spec up front, so a bad one throws before anything is created. */
+function resolveMeshSpec(p) {
+	const parent = p.parent ? findGroup(p.parent) : null;
+	if (p.parent && !parent) throw new Error('Parent group not found: ' + p.parent);
+	const tex = p.texture ? findTexture(p.texture) : (Texture.getDefault ? Texture.getDefault() : Texture.all[0]);
+	if (p.texture && !tex) throw new Error('Texture not found: ' + p.texture);
+	const shape = (p.shape || 'crystal').toLowerCase();
+	const size = num3(p.size, [8, 8, 8]);
+	const from = num3(p.from, [-size[0] / 2, 0, -size[2] / 2]);
+	const origin = num3(p.origin, [from[0] + size[0] / 2, from[1] + size[1] / 2, from[2] + size[2] / 2]);
+	const prim = meshPrimitive(shape, size[0], size[1], size[2], p.segments);
+	const uvRect = Array.isArray(p.uv) ? p.uv : [0, 0, Project.texture_width, Project.texture_height];
+	return { name: p.name || shape, shape, from, origin, rotation: num3(p.rotation, [0, 0, 0]), prim, tex, uvRect, parent };
+}
+
+function createMesh(s) {
+	const mesh = new Mesh({ name: s.name, origin: s.origin, rotation: s.rotation, vertices: {} });
+	const keys = s.prim.verts.map((v) => mesh.addVertices([
+		s.from[0] + v[0] - s.origin[0],
+		s.from[1] + v[1] - s.origin[1],
+		s.from[2] + v[2] - s.origin[2],
+	])[0]);
+	s.prim.faces.forEach((face) => {
+		const f = new MeshFace(mesh, { vertices: face.map((i) => keys[i]) });
+		if (s.tex) f.texture = s.tex.uuid;
+		mesh.addFaces(f);
+		setMeshFaceUV(mesh, f, s.uvRect);
+	});
+	mesh.init().addTo(s.parent || 'root');
+	return mesh;
+}
+
+function serializeMesh(mesh, shape) {
+	return {
+		uuid: mesh.uuid, name: mesh.name, type: 'mesh', shape,
+		vertices: Object.keys(mesh.vertices).length, faces: Object.keys(mesh.faces).length,
+	};
+}
+
+// ---------------------------------------------------------------------------
 // Modeling playbook (returned by get_guide / referenced by tool descriptions)
 // ---------------------------------------------------------------------------
 
@@ -4712,7 +4766,8 @@ const commands = {
 				});
 			} else if (mode === 'mesh') {
 				const origin = lift(pn.bone.rest, 0);
-				const mesh = new Mesh({ name: pn.name, origin: origin.map(R3), rotation: [0, 0, 0] });
+				// `vertices: {}` stops Blockbench seeding its default cube into the panel.
+				const mesh = new Mesh({ name: pn.name, origin: origin.map(R3), rotation: [0, 0, 0], vertices: {} });
 				const keys = local.map((pt) => {
 					const w = lift(pt, 0);
 					return mesh.addVertices([w[0] - origin[0], w[1] - origin[1], w[2] - origin[2]])[0];
@@ -5079,33 +5134,14 @@ const commands = {
 	// cubes only, so for those build crystals from rotated cubes instead.
 	add_mesh(p) {
 		requireProject();
-		if (typeof Mesh === 'undefined') throw new Error('Meshes are not available in this Blockbench build.');
-		if (Format && Format.meshes === false) throw new Error('Current format does not support meshes. Use a free/generic project, or build the shape from rotated cubes.');
-		const parent = p.parent ? findGroup(p.parent) : null;
-		if (p.parent && !parent) throw new Error('Parent group not found: ' + p.parent);
-		const shape = (p.shape || 'crystal').toLowerCase();
-		const size = num3(p.size, [8, 8, 8]);
-		const from = num3(p.from, [-size[0] / 2, 0, -size[2] / 2]);
-		const prim = meshPrimitive(shape, size[0], size[1], size[2], p.segments);
-		const tex = p.texture ? findTexture(p.texture) : (Texture.getDefault ? Texture.getDefault() : Texture.all[0]);
-		const uvRect = Array.isArray(p.uv) ? p.uv : [0, 0, Project.texture_width, Project.texture_height];
+		requireMeshFormat();
+		const spec = resolveMeshSpec(p);
 		Undo.initEdit({ outliner: true, elements: [] });
-		const mesh = new Mesh({
-			name: p.name || shape,
-			origin: num3(p.origin, [from[0] + size[0] / 2, from[1] + size[1] / 2, from[2] + size[2] / 2]),
-			rotation: num3(p.rotation, [0, 0, 0]),
-		});
-		const keys = prim.verts.map((v) => mesh.addVertices([from[0] + v[0], from[1] + v[1], from[2] + v[2]])[0]);
-		prim.faces.forEach((face) => {
-			const f = new MeshFace(mesh, { vertices: face.map((i) => keys[i]) });
-			if (tex) f.texture = tex.uuid;
-			mesh.addFaces(f);
-			setMeshFaceUV(mesh, f, uvRect);
-		});
-		mesh.init().addTo(parent || 'root');
-		Undo.finishEdit('MCP: add mesh');
+		const mesh = createMesh(spec);
+		// The after-state has to name the new mesh, or undoing leaves it behind.
+		Undo.finishEdit('MCP: add mesh', { outliner: true, elements: [mesh] });
 		Canvas.updateAll();
-		return { uuid: mesh.uuid, name: mesh.name, type: 'mesh', shape, vertices: Object.keys(mesh.vertices).length, faces: Object.keys(mesh.faces).length };
+		return serializeMesh(mesh, spec.shape);
 	},
 
 	// Mirror a cube or group across an axis about a pivot (default x=0) — build

@@ -254,6 +254,15 @@ test("add_cubes points at the budget and the generators instead of 6-8 boxes", (
   }
 });
 
+// --- meshes -----------------------------------------------------------------
+
+test("add_mesh says where the shape lands and that origin is only the pivot", () => {
+  const p = props("add_mesh");
+  assert.match(p.from.description, /from\.\.from\+size/);
+  assert.match(p.origin.description, /pivot only/i);
+  assert.match(p.texture.description, /unknown name is an error/i);
+});
+
 // --- argument coercion (clients serialize arrays differently) ---------------
 
 test("coerceArgs parses JSON text into the arrays and objects a schema wants", () => {

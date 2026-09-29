@@ -753,7 +753,15 @@ test("add_wing mirrors by side and lays a vertical wing out upward", () => {
 test("add_wing builds a double-sided mesh membrane whose corners are the finger tips", () => {
   class MeshFace { constructor(mesh, d) { this.vertices = d.vertices; } }
   class Mesh {
-    constructor(d) { this.name = d.name; this.origin = d.origin; this.rotation = d.rotation; this.vertices = {}; this.faces = {}; this.n = 0; }
+    constructor(d) {
+      this.name = d.name; this.origin = d.origin; this.rotation = d.rotation; this.vertices = {}; this.faces = {}; this.n = 0;
+      // Like Blockbench, seed a default cube when no vertices are given.
+      if (!d.vertices) {
+        const k = this.addVertices([2, 4, 2], [2, 4, -2], [2, 0, 2], [2, 0, -2], [-2, 4, 2], [-2, 4, -2], [-2, 0, 2], [-2, 0, -2]);
+        [[0, 2, 1, 3], [4, 5, 6, 7], [0, 1, 4, 5], [2, 6, 3, 7], [0, 4, 2, 6], [1, 3, 5, 7]]
+          .forEach((f) => this.addFaces(new MeshFace(this, { vertices: f.map((i) => k[i]) })));
+      }
+    }
     addVertices(...vs) { return vs.map((v) => { const k = `v${this.n++}`; this.vertices[k] = v; return k; }); }
     addFaces(...fs) { fs.forEach((f) => { this.faces[`f${Object.keys(this.faces).length}`] = f; }); }
     init() { return this; }
@@ -769,6 +777,7 @@ test("add_wing builds a double-sided mesh membrane whose corners are the finger 
   assert.ok(corners.every((c) => Math.abs(c[1] - 20) < 0.01));
   const faces = Object.values(panel.faces);
   assert.ok(faces.length >= 4 && faces.length % 2 === 0, "each triangle is emitted with both windings");
+  assert.ok(faces.every((f) => f.vertices.length === 3), "only membrane triangles, no default cube quads");
 });
 
 test("wings get their own rig slot and drive the fly cycle instead of the arms", () => {
