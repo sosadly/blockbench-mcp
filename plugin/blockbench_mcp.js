@@ -417,6 +417,15 @@ function serializeElement(el) {
 			autouv: el.autouv,
 			faces: serializeFaces(el),
 		});
+	} else if (typeof Mesh !== 'undefined' && el instanceof Mesh) {
+		// Where the mesh actually sits: its vertices are relative to the origin.
+		Object.assign(out, {
+			origin: el.origin,
+			rotation: el.rotation,
+			bounds: meshBounds(el),
+			vertices: Object.keys(el.vertices).length,
+			faces: Object.keys(el.faces).length,
+		});
 	}
 	return out;
 }
@@ -1584,9 +1593,30 @@ function createMesh(s) {
 	return mesh;
 }
 
+/** A mesh's axis-aligned bounds in model space (rotation ignored, like measure_model). */
+function meshBounds(mesh) {
+	// A plain loop, not Math.min(...spread): spreading a high-poly imported mesh's
+	// vertices overflows the call stack, and every serializeElement comes through here.
+	const o = mesh.origin;
+	const lo = [Infinity, Infinity, Infinity];
+	const hi = [-Infinity, -Infinity, -Infinity];
+	for (const key in mesh.vertices) {
+		const v = mesh.vertices[key];
+		for (let i = 0; i < 3; i++) {
+			const c = v[i] + o[i];
+			if (c < lo[i]) lo[i] = c;
+			if (c > hi[i]) hi[i] = c;
+		}
+	}
+	if (lo[0] === Infinity) return null;
+	const r = (n) => Math.round(n * 1000) / 1000;
+	return { from: lo.map(r), to: hi.map(r) };
+}
+
 function serializeMesh(mesh, shape) {
 	return {
 		uuid: mesh.uuid, name: mesh.name, type: 'mesh', shape,
+		origin: mesh.origin, bounds: meshBounds(mesh),
 		vertices: Object.keys(mesh.vertices).length, faces: Object.keys(mesh.faces).length,
 	};
 }

@@ -30,9 +30,10 @@ function loadPlugin(overrides = {}) {
   let seq = 0;
   const uuid = (p) => `${p}-${++seq}`;
   const elements = [];
+  const root = [];
   const attach = (node, parent) => {
     if (parent && parent !== "root") { node.parent = parent; parent.children.push(node); }
-    else node.parent = "root";
+    else { node.parent = "root"; root.push(node); }
     return node;
   };
 
@@ -200,7 +201,7 @@ function loadPlugin(overrides = {}) {
     Animation: { all: [] },
     Undo,
     Canvas: { updateAll() {} },
-    Outliner: { root: [], elements },
+    Outliner: { root, elements },
     Group,
     Cube,
     Mesh,
@@ -561,4 +562,46 @@ test("edit_element offset refuses what it cannot move, before moving anything", 
   assert.deepEqual(plain(Cube.all[0].from), [-2, 6, -1], "and so did everything in it");
   assert.equal(body.name, "body", "nothing else in the call was applied");
   assert.equal(Undo.edits.length, edits, "no edit is opened");
+});
+
+// --- mesh details -----------------------------------------------------------
+
+test("add_mesh and add_meshes report where each mesh sits", () => {
+  const { commands } = loadPlugin();
+  const one = commands.add_mesh({ shape: "wedge", from: [2, 0, -3], size: [4, 2, 6] });
+  assert.deepEqual(plain(one.bounds), { from: [2, 0, -3], to: [6, 2, 3] });
+  assert.deepEqual(plain(one.origin), [4, 1, 0]);
+  const batch = commands.add_meshes({ meshes: [{ shape: "plane", from: [0, 0, 0], size: [2, 3, 0], origin: [9, 9, 9] }] });
+  assert.deepEqual(plain(batch.meshes[0].bounds), { from: [0, 0, 0], to: [2, 3, 0] });
+  assert.deepEqual(plain(batch.meshes[0].origin), [9, 9, 9]);
+});
+
+test("get_element and list_outliner describe a mesh: origin, rotation, bounds and counts", () => {
+  const { commands } = loadPlugin();
+  commands.add_mesh({ name: "gem", shape: "gem", from: [-1, 4, -1], size: [2, 3, 2], rotation: [0, 45, 0] });
+  const gem = commands.get_element({ element: "gem" });
+  assert.deepEqual(plain(gem.origin), [0, 5.5, 0]);
+  assert.deepEqual(plain(gem.rotation), [0, 45, 0]);
+  assert.deepEqual(plain(gem.bounds), { from: [-1, 4, -1], to: [1, 7, 1] }, "bounds ignore rotation, like measure_model");
+  assert.equal(gem.vertices, 6);
+  assert.equal(gem.faces, 8);
+  const listed = commands.list_outliner().find((n) => n.name === "gem");
+  assert.deepEqual(plain(listed.bounds), plain(gem.bounds));
+});
+
+test("mesh bounds come from a plain loop, so a 200k-vertex mesh does not overflow the stack", () => {
+  const { commands, Mesh } = loadPlugin();
+  const big = new Mesh({ name: "scan", origin: [1, 2, 3], vertices: {} });
+  const N = 200000;
+  for (let i = 0; i < N; i++) big.vertices[`v${i}`] = [(i % 1000) / 10, -(i % 7), i / N];
+  big.init();
+  const res = commands.get_element({ element: "scan" });
+  assert.equal(res.vertices, N);
+  assert.deepEqual(plain(res.bounds), { from: [1, -4, 3], to: [100.9, 2, 4] });
+});
+
+test("an empty mesh reports null bounds rather than infinities", () => {
+  const { commands, Mesh } = loadPlugin();
+  new Mesh({ name: "empty", vertices: {} }).init();
+  assert.equal(commands.get_element({ element: "empty" }).bounds, null);
 });

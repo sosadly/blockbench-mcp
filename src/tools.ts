@@ -752,7 +752,7 @@ const catalogue: ToolDef[] = [
   ),
   forward(
     "add_meshes",
-    "Create many MESH primitives in one call — the mesh counterpart of add_cubes, and much faster than one add_mesh per part. Pass `meshes`: an array where each item takes the same fields as add_mesh ({name, shape, size, from, origin, rotation, segments, texture, uv, parent}); each shape spans exactly from..from+size, and `origin` is only its pivot. Every item is checked (parent, texture, shape) before anything is created, so one bad item fails the whole call instead of leaving half of it built. At most 200 per call, segments at most 128. Returns each mesh with its uuid.",
+    "Create many MESH primitives in one call — the mesh counterpart of add_cubes, and much faster than one add_mesh per part. Pass `meshes`: an array where each item takes the same fields as add_mesh ({name, shape, size, from, origin, rotation, segments, texture, uv, parent}); each shape spans exactly from..from+size, and `origin` is only its pivot. Every item is checked (parent, texture, shape) before anything is created, so one bad item fails the whole call instead of leaving half of it built. At most 200 per call, segments at most 128. Returns each mesh with its uuid and bounds.",
     obj(
       {
         meshes: {
@@ -805,7 +805,7 @@ const catalogue: ToolDef[] = [
   ),
   forward(
     "get_element",
-    "Get detailed info for one cube or group by uuid or name.",
+    "Get detailed info for one cube, mesh or group by uuid or name. A mesh reports its origin and its model-space `bounds` (rotation ignored) — the way to check where a mesh actually sits, since measure_model and screenshot framing only see cubes.",
     obj({ element: { type: "string" } }, ["element"])
   ),
 
