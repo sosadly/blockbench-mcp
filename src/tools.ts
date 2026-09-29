@@ -776,16 +776,17 @@ const catalogue: ToolDef[] = [
   ),
   forward(
     "edit_element",
-    "Edit an existing cube or group (rename, move, rotate, reparent, resize, inflate, visibility).",
+    "Edit an existing cube, mesh or group (rename, move, rotate, reparent, resize, inflate, visibility). To MOVE a cube, a mesh, a locator, a bounding box, or a group with everything in it, pass `offset`: it translates the whole thing and keeps its shape, so a misplaced part never needs deleting and re-adding.",
     obj(
       {
-        element: { type: "string", description: "uuid or name of the cube/group to edit." },
+        element: { type: "string", description: "uuid or name of the cube, mesh or group to edit." },
         new_name: { type: "string" },
-        from: vec3("New lower corner (cubes only)."),
-        to: vec3("New upper corner (cubes only)."),
-        origin: vec3("New pivot."),
+        offset: vec3("Move by [dx,dy,dz] in model coordinates: a cube's from/to/origin, a bounding box's from/to, a mesh's origin, a locator's position, or a group's origin plus everything inside it. An armature or bone (its children would stay behind) is an error, as is a group holding one, and then nothing moves. Inside a rotated parent group the move you SEE is that rotation applied to the offset."),
+        from: vec3("New lower corner (cubes and bounding boxes only — an error on anything else)."),
+        to: vec3("New upper corner (cubes and bounding boxes only — an error on anything else)."),
+        origin: vec3("New pivot. On a MESH this moves the whole mesh (its vertices are relative to it) — prefer `offset`."),
         rotation: vec3("New rotation in degrees."),
-        inflate: { type: "number" },
+        inflate: { type: "number", description: "Cubes only — an error on anything else." },
         visibility: { type: "boolean" },
         parent: { type: "string", description: "uuid/name of new parent group, or 'root'." },
       },

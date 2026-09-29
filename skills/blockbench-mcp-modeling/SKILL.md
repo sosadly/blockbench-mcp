@@ -235,7 +235,8 @@ the result ("close enough"). Use the reference engine so the match is a measured
   `list/clear_references`.
 - Build: `add_groups`, `add_cubes` (bulk), **`voxelize_matrix`**, **`add_hollow_volume`**,
   **`generate_array`**, **`extrude_chain`**, `add_plane`, `add_mesh`, `add_meshes` (bulk),
-  `edit_element`, `delete_element`, `mirror_element`.
+  `edit_element` (`offset` moves a part, or a group with everything in it),
+  `delete_element`, `mirror_element`.
 - Rig: `create_rig` (humanoid/quadruped, segmented), `check_rig`, `get_rig`.
 - Quality gates: **`audit_complexity`** (density + monoliths + layering), `check_model`
   (z-fighting, untextured faces, UVs), `check_sides`, `check_rig`.

@@ -97,6 +97,8 @@ function loadPlugin(overrides = {}) {
       this.parent = "root";
       this.uuid = uuid("m");
     }
+    // Blockbench: the origin is where a mesh sits, and `position` only reads it.
+    get position() { return this.origin; }
     addVertices(...vs) {
       return vs.map((v) => { const k = `v${this.nextKey++}`; this.vertices[k] = v.slice(); return k; });
     }
@@ -104,6 +106,41 @@ function loadPlugin(overrides = {}) {
       return fs.map((f) => { const k = `f${this.nextKey++}`; this.faces[k] = f; return k; });
     }
     init() { Mesh.all.push(this); elements.push(this); return this; }
+    addTo(parent) { return attach(this, parent); }
+  }
+
+  class Locator {
+    constructor(data = {}) {
+      this.name = data.name || "locator";
+      this.position = (data.position || [0, 0, 0]).slice();
+      this.rotation = [0, 0, 0];
+      this.parent = "root";
+      this.uuid = uuid("l");
+    }
+    // Blockbench (Locator, NullObject, Billboard): the position is stored, and
+    // `origin` is a getter with no setter that returns it.
+    get origin() { return this.position; }
+    init() { elements.push(this); return this; }
+    addTo(parent) { return attach(this, parent); }
+  }
+
+  // Built like Blockbench 5's BoundingBox: from/to are accessors with setters,
+  // while origin and position are getters with no setter returning a fresh [0,0,0].
+  class BoundingBox {
+    constructor(data = {}) {
+      this._static = { properties: { from: (data.from || [0, 0, 0]).slice(), to: (data.to || [1, 1, 1]).slice() } };
+      this.name = data.name || "bounding_box";
+      this.type = "bounding_box";
+      this.parent = "root";
+      this.uuid = uuid("b");
+    }
+    get from() { return this._static.properties.from; }
+    set from(v) { this._static.properties.from = v; }
+    get to() { return this._static.properties.to; }
+    set to(v) { this._static.properties.to = v; }
+    get origin() { return [0, 0, 0]; }
+    get position() { return [0, 0, 0]; }
+    init() { elements.push(this); return this; }
     addTo(parent) { return attach(this, parent); }
   }
 
@@ -168,12 +205,13 @@ function loadPlugin(overrides = {}) {
     Cube,
     Mesh,
     MeshFace,
+    Locator,
     ...overrides,
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(instrumented, sandbox, { filename: "blockbench_mcp.js" });
-  return { commands: sandbox.__MCP_COMMANDS__, Group, Cube, Mesh, Texture, Undo, sandbox };
+  return { commands: sandbox.__MCP_COMMANDS__, Group, Cube, Mesh, Locator, BoundingBox, Texture, Undo, sandbox };
 }
 
 /** Values made inside the vm carry that realm's prototypes; compare them by value. */
@@ -376,4 +414,151 @@ test("create_textures accepts a JSON-string list", async () => {
   const res = await commands.create_textures({ textures: '[{"name":"a","fill":"#111111"},{"name":"b"}]' });
   assert.equal(res.created, 2);
   assert.equal(Texture.all.length, 3);
+});
+
+// --- edit_element: offset ----------------------------------------------------
+
+test("edit_element offset moves a cube's from, to and origin together", () => {
+  const { commands, Cube, Undo } = loadPlugin();
+  commands.add_cube({ name: "plate", from: [0, 0, 0], to: [2, 1, 4], origin: [1, 0, 2] });
+  commands.edit_element({ element: "plate", offset: [3, -1, 0.5] });
+  const plate = Cube.all[0];
+  assert.deepEqual(plain(plate.from), [3, -1, 0.5]);
+  assert.deepEqual(plain(plate.to), [5, 0, 4.5]);
+  assert.deepEqual(plain(plate.origin), [4, -1, 2.5]);
+  const edit = Undo.edits[Undo.edits.length - 1];
+  assert.equal(edit.aspects.elements.length, 1);
+  assert.equal(edit.aspects.elements[0], plate);
+});
+
+test("edit_element offset moves a mesh by its origin and leaves its vertices alone", () => {
+  const { commands, Mesh } = loadPlugin();
+  commands.add_mesh({ name: "gem", shape: "gem", from: [0, 0, 0], size: [2, 2, 2] });
+  const gem = Mesh.all[0];
+  const before = plain(gem.vertices);
+  commands.edit_element({ element: "gem", offset: [5, 0, -1] });
+  assert.deepEqual(plain(gem.origin), [6, 1, 0]);
+  assert.deepEqual(plain(gem.vertices), before, "vertices are relative to the origin, so they stay put");
+  assert.deepEqual(worldBounds(gem), { from: [5, 0, -1], to: [7, 2, 1] });
+});
+
+test("edit_element offset moves a locator by its position, not through its origin getter", () => {
+  const { commands, Locator } = loadPlugin();
+  const muzzle = new Locator({ name: "muzzle", position: [1, 2, 3] }).init();
+  commands.edit_element({ element: "muzzle", offset: [0, 0, -4] });
+  assert.deepEqual(plain(muzzle.position), [1, 2, -1]);
+});
+
+test("edit_element offset on a group moves everything inside it, and Undo snapshots all of it", () => {
+  const { commands, Group, Cube, Mesh, Locator, Undo } = loadPlugin();
+  commands.add_group({ name: "arm", origin: [4, 20, 0] });
+  commands.add_group({ name: "forearm", origin: [4, 14, 0], parent: "arm" });
+  commands.add_cube({ name: "bracer", from: [3, 10, -1], to: [5, 14, 1], origin: [4, 14, 0], parent: "forearm" });
+  commands.add_mesh({ name: "spike", shape: "cone", from: [5, 18, 0], size: [1, 2, 1], parent: "arm" });
+  const [arm, forearm] = Group.all;
+  const hand = new Locator({ name: "hand", position: [4, 9, 0] }).init().addTo(forearm);
+  const spike = Mesh.all[0];
+  const spikeBefore = worldBounds(spike);
+
+  commands.edit_element({ element: "arm", offset: [0, -2, 1] });
+
+  assert.deepEqual(plain(arm.origin), [4, 18, 1]);
+  assert.deepEqual(plain(forearm.origin), [4, 12, 1], "a sub-group moves once, not once per level");
+  assert.deepEqual(plain(Cube.all[0].from), [3, 8, 0]);
+  assert.deepEqual(plain(Cube.all[0].to), [5, 12, 2]);
+  assert.deepEqual(plain(Cube.all[0].origin), [4, 12, 1]);
+  assert.deepEqual(worldBounds(spike), {
+    from: spikeBefore.from.map((v, i) => v + [0, -2, 1][i]),
+    to: spikeBefore.to.map((v, i) => v + [0, -2, 1][i]),
+  });
+  assert.deepEqual(plain(hand.position), [4, 7, 1]);
+
+  const { aspects } = Undo.edits[Undo.edits.length - 1];
+  assert.equal(aspects.groups.length, 2);
+  assert.ok(aspects.groups.includes(arm) && aspects.groups.includes(forearm), "both groups are snapshotted");
+  assert.equal(aspects.elements.length, 3);
+  for (const el of [Cube.all[0], spike, hand]) assert.ok(aspects.elements.includes(el), `${el.name} is snapshotted`);
+
+  // Without an offset a group edit touches only the group, so that is all Undo needs.
+  commands.edit_element({ element: "arm", new_name: "upper_arm" });
+  const rename = Undo.edits[Undo.edits.length - 1].aspects;
+  assert.equal(rename.group, arm);
+  assert.equal(rename.elements, undefined);
+});
+
+test("edit_element refuses from/to/inflate where they would do nothing, before changing anything", () => {
+  const { commands, Cube, Mesh, Undo } = loadPlugin();
+  commands.add_mesh({ name: "gem", shape: "gem" });
+  commands.add_group({ name: "body" });
+  commands.add_cube({ name: "plate", from: [0, 0, 0], to: [1, 1, 1] });
+  const edits = Undo.edits.length;
+  assert.throws(
+    () => commands.edit_element({ element: "gem", new_name: "moved", from: [0, 5, 0] }),
+    /from\/to apply only to cubes and bounding boxes; to move "gem" pass offset/
+  );
+  assert.throws(() => commands.edit_element({ element: "gem", to: [1, 1, 1] }), /from\/to apply only/);
+  assert.throws(() => commands.edit_element({ element: "body", from: [1, 1, 1] }), /from\/to apply only/);
+  assert.throws(() => commands.edit_element({ element: "body", inflate: 0.5 }), /inflate applies to cubes only/);
+  assert.throws(() => commands.edit_element({ element: "gem", inflate: 0.5 }), /inflate applies to cubes only/);
+  assert.equal(Mesh.all[0].name, "gem", "nothing else in the call was applied");
+  assert.equal(Mesh.all[0].from, undefined, "no stray property on the mesh");
+  assert.equal(Undo.edits.length, edits, "no edit is opened");
+
+  commands.edit_element({ element: "plate", from: [0, 0, -1], inflate: 0.25 });
+  assert.deepEqual(plain(Cube.all[0].from), [0, 0, -1]);
+  assert.equal(Cube.all[0].inflate, 0.25);
+});
+
+test("edit_element resizes a bounding box with from/to, and offset moves it by them", () => {
+  const { commands, BoundingBox, Group, Undo } = loadPlugin();
+  const hitbox = new BoundingBox({ name: "hitbox", from: [0, 0, 0], to: [4, 4, 4] }).init();
+  commands.edit_element({ element: "hitbox", from: [0, 1, 0] });
+  assert.deepEqual(plain(hitbox.from), [0, 1, 0], "a bounding box stores from/to, so they apply");
+  // Its origin and position are constant getters: the move has to go through from/to.
+  commands.edit_element({ element: "hitbox", offset: [2, 0, -1] });
+  assert.deepEqual(plain(hitbox.from), [2, 1, -1]);
+  assert.deepEqual(plain(hitbox.to), [6, 4, 3]);
+  assert.throws(() => commands.edit_element({ element: "hitbox", inflate: 1 }), /inflate applies to cubes only/);
+
+  commands.add_group({ name: "body" });
+  const feet = new BoundingBox({ name: "feet", from: [0, 0, 0], to: [2, 1, 2] }).init().addTo(Group.all[0]);
+  commands.edit_element({ element: "body", offset: [0, 3, 0] });
+  assert.deepEqual(plain(feet.from), [0, 3, 0], "a bounding box inside a group moves with it");
+  assert.deepEqual(plain(feet.to), [2, 4, 2]);
+  assert.ok(Undo.edits[Undo.edits.length - 1].aspects.elements.includes(feet));
+});
+
+test("edit_element offset refuses what it cannot move, before moving anything", () => {
+  const { commands, Group, Cube, Undo, sandbox } = loadPlugin();
+  commands.add_group({ name: "body", origin: [0, 8, 0] });
+  commands.add_cube({ name: "torso", from: [-2, 6, -1], to: [2, 12, 1], parent: "body" });
+  // An armature has bones of its own, which moving it alone would leave behind.
+  const rig = { name: "rig", type: "armature", uuid: "a-1", parent: "root", origin: [0, 0, 0], children: [] };
+  // Placed only through getters with no setter: there is nothing to write to.
+  const marker = { name: "marker", type: "marker", uuid: "x-1", parent: "root", get origin() { return [0, 0, 0]; } };
+  sandbox.Outliner.elements.push(rig, marker);
+  const edits = Undo.edits.length;
+
+  assert.throws(
+    () => commands.edit_element({ element: "rig", offset: [1, 0, 0] }),
+    /offset can't move "rig" \(armature\): it has children that would not move with it/
+  );
+  assert.throws(
+    () => commands.edit_element({ element: "marker", offset: [1, 0, 0] }),
+    /offset can't move "marker" \(marker\): it has no position to move/
+  );
+  assert.deepEqual(plain(rig.origin), [0, 0, 0]);
+
+  // One element the offset can't move stops the whole group, not just itself.
+  const body = Group.all[0];
+  marker.parent = body;
+  body.children.push(marker);
+  assert.throws(
+    () => commands.edit_element({ element: "body", new_name: "moved", offset: [0, 5, 0] }),
+    /offset can't move "marker"/
+  );
+  assert.deepEqual(plain(body.origin), [0, 8, 0], "the group stayed put");
+  assert.deepEqual(plain(Cube.all[0].from), [-2, 6, -1], "and so did everything in it");
+  assert.equal(body.name, "body", "nothing else in the call was applied");
+  assert.equal(Undo.edits.length, edits, "no edit is opened");
 });

@@ -1592,6 +1592,76 @@ function serializeMesh(mesh, shape) {
 }
 
 // ---------------------------------------------------------------------------
+// Moving outliner nodes (edit_element's `offset`)
+// ---------------------------------------------------------------------------
+
+/** Whether `obj[key]` can be written: a value or a setter, not a getter that aliases another field or a constant. */
+function isStoredProperty(obj, key) {
+	for (let o = obj; o; o = Object.getPrototypeOf(o)) {
+		const d = Object.getOwnPropertyDescriptor(o, key);
+		if (d) return 'value' in d || typeof d.set === 'function';
+	}
+	return false;
+}
+
+/**
+ * The vectors that place an element and can actually be written. Blockbench
+ * answers some of these names with a getter that has no setter: a mesh's
+ * `position` returns its origin, a locator's, null object's or billboard's
+ * `origin` returns its position, and a bounding box's origin and position both
+ * return a fresh [0,0,0]. Assigning to one of those silently does nothing.
+ */
+function storedPlacement(node) {
+	return ['from', 'to', 'origin', 'position'].filter((k) => Array.isArray(node[k]) && isStoredProperty(node, k));
+}
+
+/**
+ * Why `offset` can't move `node`, or '' when it can. Checked for everything a
+ * group holds before anything moves, so an offset never reports success while
+ * leaving part of the model where it was.
+ */
+function explainCannotMove(node) {
+	if (node instanceof Group) {
+		for (const child of node.children) {
+			const reason = explainCannotMove(child);
+			if (reason) return reason;
+		}
+		return '';
+	}
+	const what = `"${node.name}" (${node.type || 'element'})`;
+	// An armature or a bone has children of its own, which moving it alone would leave behind.
+	if (Array.isArray(node.children)) return `offset can't move ${what}: it has children that would not move with it.`;
+	if (!storedPlacement(node).length) return `offset can't move ${what}: it has no position to move.`;
+	return '';
+}
+
+/**
+ * Translate a group with everything inside it, or an element by every placement
+ * vector it stores, by `d`: a cube's from/to/origin, a bounding box's from/to, a
+ * mesh's origin (its vertices are relative to it), a locator's position.
+ */
+function moveNode(node, d) {
+	const add = (v) => [v[0] + d[0], v[1] + d[1], v[2] + d[2]];
+	if (node instanceof Group) {
+		node.origin = add(node.origin);
+		node.children.forEach((child) => moveNode(child, d));
+	} else {
+		for (const key of storedPlacement(node)) node[key] = add(node[key]);
+	}
+}
+
+/** Everything inside a group, split into sub-groups and elements, for Undo. */
+function descendants(group) {
+	const groups = [];
+	const elements = [];
+	const walk = (g) => g.children.forEach((c) => {
+		if (c instanceof Group) { groups.push(c); walk(c); } else elements.push(c);
+	});
+	walk(group);
+	return { groups, elements };
+}
+
+// ---------------------------------------------------------------------------
 // Modeling playbook (returned by get_guide / referenced by tool descriptions)
 // ---------------------------------------------------------------------------
 
@@ -5227,15 +5297,38 @@ const commands = {
 		const el = findNode(p.element || p.uuid || p.name);
 		if (!el) throw new Error('Element not found: ' + (p.element || p.uuid || p.name));
 		const isGroup = el instanceof Group;
-		Undo.initEdit(isGroup ? { group: el } : { elements: [el] });
+		// from/to only mean something where they are stored, as a cube's or a
+		// bounding box's corners: a group ignored them, and a mesh or locator got
+		// them as stray properties that did nothing. inflate is a cube's alone.
+		// Refuse all of it, and an offset that can't move everything, up front.
+		const hasBox = isStoredProperty(el, 'from') && isStoredProperty(el, 'to');
+		if (!hasBox && (p.from || p.to)) {
+			throw new Error(`from/to apply only to cubes and bounding boxes; to move "${el.name}" pass offset.`);
+		}
+		if (!(el instanceof Cube) && p.inflate !== undefined) {
+			throw new Error(`inflate applies to cubes only, and "${el.name}" is not one.`);
+		}
+		if (p.offset) {
+			const reason = explainCannotMove(el);
+			if (reason) throw new Error(reason);
+		}
+		// An offset on a group moves every sub-group and element inside it, so Undo
+		// has to snapshot all of them, not just the group itself.
+		let undoAspects = isGroup ? { group: el } : { elements: [el] };
+		if (isGroup && p.offset) {
+			const inside = descendants(el);
+			undoAspects = { groups: [el, ...inside.groups], elements: inside.elements };
+		}
+		Undo.initEdit(undoAspects);
 		if (p.new_name !== undefined) el.name = p.new_name;
 		if (p.origin) el.origin = num3(p.origin, el.origin);
 		if (p.rotation) el.rotation = num3(p.rotation, el.rotation);
-		if (!isGroup) {
+		if (hasBox) {
 			if (p.from) el.from = num3(p.from, el.from);
 			if (p.to) el.to = num3(p.to, el.to);
-			if (p.inflate !== undefined) el.inflate = Number(p.inflate);
 		}
+		if (el instanceof Cube && p.inflate !== undefined) el.inflate = Number(p.inflate);
+		if (p.offset) moveNode(el, num3(p.offset, [0, 0, 0]));
 		if (p.visibility !== undefined) el.visibility = !!p.visibility;
 		if (p.parent !== undefined) {
 			const parent = p.parent === 'root' ? 'root' : findGroup(p.parent);

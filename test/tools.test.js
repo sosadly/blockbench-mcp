@@ -277,6 +277,21 @@ test("add_meshes takes a list of add_mesh specs and states its limits", () => {
   assert.deepEqual(one.meshes, [{ shape: "gem" }]);
 });
 
+test("edit_element offers `offset` for moving, and says which elements take from/to/inflate", () => {
+  const p = props("edit_element");
+  assert.equal(p.offset.type, "array");
+  assert.deepEqual(p.offset.items, { type: "number" });
+  assert.equal(p.offset.maxItems, 3);
+  assert.match(p.offset.description, /armature/, "offset says what it refuses");
+  for (const key of ["from", "to"]) {
+    assert.match(p[key].description, /cubes and bounding boxes only/i, `${key} should say which elements take it`);
+  }
+  assert.match(p.inflate.description, /cubes only/i);
+  assert.match(byName("edit_element").description, /offset/);
+  assert.match(byName("edit_element").description, /mesh/);
+  assert.deepEqual(coerceArgs(byName("edit_element").inputSchema, { offset: "0,-2,1" }).offset, [0, -2, 1]);
+});
+
 // --- textures ---------------------------------------------------------------
 
 test("create_textures takes a list of solid fills and says it refuses a data_url", () => {
