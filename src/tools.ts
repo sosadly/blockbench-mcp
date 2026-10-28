@@ -6,6 +6,16 @@
  * image blocks so the model can actually *see* the result.
  */
 import { callBlockbench } from "./client.js";
+import {
+  searchReferences,
+  fetchThumbnails,
+  downloadResult,
+  downloadImage,
+  describeSubject,
+  lastSearchResults,
+  cachedSearch,
+  type RefResult,
+} from "./references.js";
 
 export type ContentBlock =
   | { type: "text"; text: string }
@@ -161,6 +171,65 @@ function shotBlocks(shots: any[]): ContentBlock[] {
   return blocks;
 }
 
+/** Pull data-URL images out of a bridge result: images become blocks, the rest stays JSON. */
+function splitImages(res: any, keys: string[]): ContentBlock[] {
+  const images: ContentBlock[] = [];
+  const clone: any = Array.isArray(res) ? [...res] : { ...res };
+  for (const k of keys) {
+    const v = clone?.[k];
+    if (typeof v === "string" && v.startsWith("data:image/")) {
+      const m = /^data:(image\/[a-z+]+);base64,(.*)$/s.exec(v);
+      if (m) images.push({ type: "image", data: m[2], mimeType: m[1] === "image/jpg" ? "image/jpeg" : m[1] });
+      delete clone[k];
+    }
+  }
+  return [...text(clone), ...images];
+}
+
+/** A bridge tool whose result carries one or more images under `imageKeys`. */
+function forwardWithImages(
+  name: string,
+  description: string,
+  inputSchema: Record<string, unknown>,
+  imageKeys: string[],
+  action = name
+): ToolDef {
+  return { name, description, inputSchema, handler: async (args) => splitImages(await callBlockbench(action, args), imageKeys) };
+}
+
+/** Like shotBlocks, for results whose shots also need their bulky fields dropped from the JSON. */
+/** Download search results by number and pin them in Blockbench as references. */
+async function loadSearchResults(results: RefResult[], want: number[], blocks: ContentBlock[]): Promise<void> {
+  for (const n of want) {
+    const r = results.find((x) => x.index === n);
+    if (!r) { blocks.push({ type: "text", text: `load: there is no result #${n}.` }); continue; }
+    try {
+      const img = await downloadResult(r);
+      const res: any = await callBlockbench("load_reference", {
+        data_url: `data:${img.mime};base64,${img.base64}`,
+        name: `ref${n}_${(r.title || "web").replace(/[^a-z0-9]+/gi, "_").slice(0, 40)}`,
+        source_url: r.page_url || r.image_url,
+      });
+      blocks.push({ type: "text", text: `Loaded #${n} "${r.title || "web"}" as reference "${res.name}" (${res.width}x${res.height}${img.used_thumbnail ? ", thumbnail only — the original would not download" : ""}). Colours: ${(res.colors || []).join(", ")}` });
+    } catch (e: any) {
+      blocks.push({ type: "text", text: `Could not load #${n}: ${e?.message ?? e}` });
+    }
+  }
+}
+
+function shotsResult(res: any, header: string): ContentBlock[] {
+  const shots = res?.shots || [];
+  const rest: any = { ...res };
+  delete rest.shots;
+  return [{ type: "text", text: header + "\n" + JSON.stringify(rest, null, 2) }, ...shotBlocks(shots)];
+}
+
+const FIX_Z = {
+  type: "boolean",
+  description:
+    "Automatically resolve the coplanar faces this call creates (default true): the smaller cube of each pair gets a tiny inflate, UVs untouched. The result reports z_fight_fixed. Pass false only to inspect the raw overlaps.",
+};
+
 /** Tool whose result is just the JSON returned by the bridge. */
 function forward(
   name: string,
@@ -181,16 +250,16 @@ const catalogue: ToolDef[] = [
   // ===== status & discovery ================================================
   forward(
     "get_status",
-    "Get the current Blockbench state: open project, format, counts of cubes/groups/textures/animations, and edit mode. Call this first to understand the workspace. If you are about to BUILD or TEXTURE a model, call get_guide first. If the user is matching a REFERENCE image (they may have dropped one into the MCP Copilot panel), call get_reference to see it, build, then call compare_reference every pass until match_percent is high — do not judge the match by eye.",
+    "Get the current Blockbench state: open project, format, counts of cubes/groups/textures/animations, and edit mode. Call this first to understand the workspace. If you are about to BUILD or TEXTURE a model, call get_guide first. REFERENCES FIRST: if the subject is a known character, creature, franchise item, vehicle, building or real product, call find_references BEFORE modeling (even if the user gave one image — you need the other angles), load the best 2-4, then make_palette from them. If the user dropped a reference into the MCP Copilot panel, call get_reference to see it. Build, then compare_reference every pass until match_percent is high — do not judge the match by eye.",
     obj({})
   ),
   forward(
     "get_guide",
-    "Return a playbook. Pass `topic`: 'modeling' (default — proportions, detail, rotation), 'detailing' (the cube budgets and the 4-layer doctrine that stop models coming out as 15 boxes — read it before building anything with a costume, armour or cloth), 'orientation' (which side is the model's LEFT — read before anything with a left and a right), 'rigging' (bone hierarchy, joint origins, why 2-bone limbs animate like cardboard), 'texturing' (the smooth @volmur/Hytale look), 'vfx' (pixelated flames/energy/projectiles), 'animation' (axis signs, gaits, easing, the measure-then-review loop), 'review' (how to get the user to confirm work instead of declaring it good yourself), or 'reference' (how to ACTUALLY match a reference image). READ the relevant topic BEFORE building/rigging/texturing/animating — it dramatically improves results.",
+    "Return a playbook. Pass `topic`: 'modeling' (default — proportions, detail, rotation), 'detailing' (the cube budgets and the 4-layer doctrine that stop models coming out as 15 boxes — read it before building anything with a costume, armour or cloth), 'orientation' (which side is the model's LEFT — read before anything with a left and a right), 'rigging' (bone hierarchy, joint origins, why 2-bone limbs animate like cardboard), 'texturing' (the smooth @volmur/Hytale look), 'vfx' (pixelated flames/energy/projectiles), 'animation' (axis signs, gaits, easing, the measure-then-review loop), 'review' (how to get the user to confirm work instead of declaring it good yourself), 'reference' (how to ACTUALLY match a reference image, find more references on the web and build the palette), 'character' (anime/stylised characters: proportions, face, hair, cloth, the generator recipe), 'mechanism' (gears, pistons, pipes and animating them) or 'inspection' (how to find and fix the small things screenshots miss). READ the relevant topic BEFORE building/rigging/texturing/animating — it dramatically improves results.",
     obj({
       topic: {
         type: "string",
-        enum: ["modeling", "detailing", "orientation", "rigging", "texturing", "vfx", "animation", "review", "reference"],
+        enum: ["modeling", "detailing", "orientation", "rigging", "texturing", "vfx", "animation", "review", "reference", "character", "mechanism", "inspection"],
         description: "Which playbook to return. Default 'modeling'.",
       },
     })
@@ -317,16 +386,163 @@ const catalogue: ToolDef[] = [
       return blocks;
     },
   },
-  forward(
-    "load_reference",
-    "Load a reference image you want the model to match, from a disk `path` (desktop) or a `data_url`. It is stored so compare_reference can score against it, and best-effort pinned behind the model in the viewport. Usually the user drops the reference into the MCP Copilot panel instead (then just use get_reference) — use this when you have a file path or image data yourself.",
-    obj({
+  {
+    name: "find_references",
+    description:
+      "Search the web for reference images of the subject and show them as ONE numbered contact sheet, so you can pick the useful ones. ALWAYS do this before modeling anything that exists outside this conversation — a named character (anime, game, film), a known creature, a franchise weapon/item, a vehicle model, a landmark, a real product — even when the user already gave one image: you need the back and side views, the small parts and the true colours. Safe search is always on. Pick 2-4 results that show the WHOLE subject clearly (turnaround/reference sheets, full-body official art, side/front views; skip fan-art restyles, cosplay photos and cropped busts) and load them with `load` or load_reference {result:N}. `kind` tunes the queries (character adds 'full body', 'reference sheet', 'back view'...). Also returns a short Wikipedia description when one exists.",
+    inputSchema: obj(
+      {
+        query: { type: "string", description: "The subject, as specific as possible: 'Nagisa Shiota Assassination Classroom', 'Mosin-Nagant M91/30', 'Creeper Minecraft'." },
+        kind: {
+          type: "string",
+          enum: ["auto", "character", "creature", "object", "vehicle", "building", "mechanism"],
+          description: "What it is — picks the search angles (default auto).",
+        },
+        queries: strArr("Your own search queries instead of the generated ones (max 5)."),
+        limit: { type: "number", description: "How many results to show (default 8, max 24)." },
+        sources: strArr("Engines in order of preference: 'bing', 'duckduckgo', 'wikimedia' (free-licence photos/diagrams). Default bing then duckduckgo."),
+        load: {
+          oneOf: [{ type: "array", items: { type: "number" } }, { type: "boolean" }],
+          description: "Load these result numbers straight into Blockbench as references (true = the first 2).",
+        },
+        describe: { type: "boolean", description: "Add a short Wikipedia description of the subject (default true)." },
+      },
+      ["query"]
+    ),
+    handler: async (args) => {
+      const want: number[] = args.load === true ? [1, 2] : Array.isArray(args.load) ? args.load.map(Number) : [];
+      const opts = {
+        query: String(args.query || ""),
+        kind: args.kind,
+        queries: args.queries,
+        limit: args.limit,
+        sources: args.sources,
+      };
+      const blocks: ContentBlock[] = [];
+      // Loading from a sheet already shown: reuse those results so the numbers still match.
+      const cached = want.length ? cachedSearch(opts) : null;
+      if (cached) {
+        await loadSearchResults(cached, want, blocks);
+        return blocks;
+      }
+      const { results, errors, queries } = await searchReferences(opts);
+      const lines = results.map((r) => {
+        let host = "";
+        try { host = new URL(r.page_url || r.image_url).hostname.replace(/^www\./, ""); } catch { /* keep blank */ }
+        return `#${r.index} ${r.title || "(untitled)"} — ${host}${r.width ? ` ${r.width}x${r.height}` : ""} [${r.source}]`;
+      });
+      const about = args.describe === false ? null : await describeSubject(String(args.query || ""));
+      blocks.push({
+        type: "text",
+        text:
+          (results.length ? `${results.length} result(s) for: ${queries.join(" | ")}\n${lines.join("\n")}` : `No results for: ${queries.join(" | ")}`) +
+          (about ? `\n\nAbout (${about.title}): ${about.extract}` : "") +
+          (errors.length ? `\n\n(search warnings: ${errors.slice(0, 3).join("; ")})` : "") +
+          (results.length ? `\n\nNext: load the best with load_reference {result:N} (or call again with the same query and load:[N,M] — the numbers stay the same), then get_reference to study them and make_palette for the colours.` : ""),
+      });
+      if (!results.length) return blocks;
+      const thumbs = await fetchThumbnails(results);
+      const items = results
+        .map((r, i) => (thumbs[i] ? { number: r.index, label: r.title, data_url: `data:${thumbs[i]!.mime};base64,${thumbs[i]!.base64}` } : null))
+        .filter(Boolean);
+      let sheetOk = false;
+      if (items.length) {
+        try {
+          const sheet: any = await callBlockbench("contact_sheet", { images: items });
+          const b64 = String(sheet.data_url || "").replace(/^data:image\/png;base64,/, "");
+          if (b64) { blocks.push({ type: "image", data: b64, mimeType: "image/png" }); sheetOk = true; }
+        } catch {
+          /* Blockbench not reachable: fall back to the separate thumbnails */
+        }
+        if (!sheetOk) {
+          thumbs.forEach((t, i) => {
+            if (!t) return;
+            blocks.push({ type: "text", text: `#${results[i].index}` });
+            blocks.push({ type: "image", data: t.base64, mimeType: t.mime });
+          });
+        }
+      }
+      await loadSearchResults(results, want, blocks);
+      return blocks;
+    },
+  },
+  {
+    name: "load_reference",
+    description:
+      "Load a reference image you want the model to match: a find_references result number (`result`), a web `url`, a disk `path` (desktop) or a `data_url`. It is stored so compare_reference can score against it, pinned behind the model in the viewport, and its main colours are reported straight away. Usually the user drops the reference into the MCP Copilot panel instead (then just use get_reference).",
+    inputSchema: obj({
+      result: { type: "number", description: "A result number from the last find_references call." },
+      url: { type: "string", description: "Public http(s) image URL to download." },
       path: { type: "string", description: "Absolute image path (desktop)." },
       data_url: { type: "string", description: "'data:image/png;base64,...' image data." },
       name: { type: "string", description: "Optional label." },
       overlay: { type: "boolean", description: "Pin it in the viewport (default true; non-fatal if unsupported)." },
       opacity: { type: "number", description: "Viewport overlay opacity 0..1 (default 0.45)." },
-    })
+    }),
+    handler: async (args) => {
+      const params: Record<string, any> = { ...args };
+      if (args.result != null) {
+        const r = lastSearchResults().find((x) => x.index === Number(args.result));
+        if (!r) throw new Error(`No result #${args.result} — run find_references first (results are kept until the next search).`);
+        const img = await downloadResult(r);
+        params.data_url = `data:${img.mime};base64,${img.base64}`;
+        params.name = params.name || `ref${r.index}_${(r.title || "web").replace(/[^a-z0-9]+/gi, "_").slice(0, 40)}`;
+        params.source_url = r.page_url || r.image_url;
+      } else if (args.url) {
+        const img = await downloadImage(String(args.url));
+        params.data_url = `data:${img.mime};base64,${img.base64}`;
+        params.source_url = String(args.url);
+        if (!params.name) params.name = String(args.url).split(/[/?#]/).filter(Boolean).pop()?.slice(0, 60) || "web_reference";
+      }
+      delete params.result;
+      delete params.url;
+      return text(await callBlockbench("load_reference", params));
+    },
+  },
+  forwardWithImages(
+    "zoom_reference",
+    "Zoom into part of a reference (the face, a buckle, the hem, a gear) and return it enlarged, so small details are read instead of guessed. `rect` is [x, y, w, h] as 0-1 fractions of the image (or pixels).",
+    obj(
+      {
+        rect: numArr("[x, y, w, h] — fractions 0-1 of the image (e.g. [0.35, 0.05, 0.3, 0.22] for a face), or pixels."),
+        reference: { type: "string", description: "Reference id/name (default the most recent)." },
+        size: { type: "number", description: "Longest side of the zoomed image in px (default 640)." },
+      },
+      ["rect"]
+    ),
+    ["data_url"]
+  ),
+  forwardWithImages(
+    "make_palette",
+    "Build the model's COLOUR PALETTE and store it on the project, so texturing uses real colours instead of guessed hex codes. Three ways: (1) from a reference/concept image (default when one is loaded): background removed, light and shadow of the same material merged into one family, each family returned with a 5-step hue-shifted ramp [deep shadow, shadow, BASE, light, highlight]; (2) from `regions` — point at parts of the reference ({name:'hair', x:0.5, y:0.1} or rect) and each becomes a named entry; (3) from a TEXT brief — `colors` you name ({hair:'#5a6fd0', coat:'navy'}), or a harmony from `base_color`/`hue` + `scheme` + `mood`. Afterwards detail_cubes rules can use color:'$hair', '$hair.shadow', '$hair.light', '$hair.highlight', '$hair.deep'. Returns a swatch card image. Do this right after loading references, and for text-only tasks before texturing.",
+    obj({
+      reference: { type: "string", description: "Reference id/name (default the most recent)." },
+      source: { type: "string", enum: ["auto", "reference", "text"], description: "Force reading the image or the text brief (default auto)." },
+      regions: {
+        type: "array",
+        items: { type: "object" },
+        description: "Named spots on the reference: [{name:'hair', x:0.52, y:0.12}, {name:'skirt', rect:[0.3,0.6,0.4,0.15]}, ...] — fractions 0-1. Point at flat-lit areas, not highlights or line art. Optional `material` per region.",
+      },
+      include_auto: { type: "boolean", description: "With regions: also add the automatic families (default false)." },
+      count: { type: "number", description: "Max automatic families (default 9)." },
+      clusters: { type: "number", description: "k-means clusters before merging (default 14)." },
+      min_share: { type: "number", description: "Drop families smaller than this share of the image (default 0.012)." },
+      keep_background: { type: "boolean", description: "Do not drop the border colour (default false)." },
+      colors: { type: "object", description: "Text brief: {key: colour} you already know, e.g. {hair:'#5b6bd6', skin:'#f6d7c6', skirt:'#b3262d'}." },
+      base_color: { type: "string", description: "Text brief: the main colour to build a harmony around." },
+      hue: { type: "number", description: "Text brief: main hue in degrees when no base_color (0 red, 120 green, 240 blue)." },
+      scheme: { type: "string", enum: ["monochrome", "analogous", "complementary", "split", "triadic", "tetradic"], description: "Harmony (default split)." },
+      mood: { type: "string", enum: ["neutral", "vibrant", "pastel", "muted", "dark", "earthy", "neon", "warm", "cool", "grim", "cute", "royal"], description: "Saturation/lightness feel (default neutral)." },
+      name: { type: "string", description: "Palette name." },
+      store: { type: "boolean", description: "Save on the project for '$key' colours (default true)." },
+    }),
+    ["card_data_url"]
+  ),
+  forwardWithImages(
+    "get_palette",
+    "Show the palette stored on this project (the keys usable as color:'$key' in detail_cubes), with its swatch card.",
+    obj({}),
+    ["card_data_url"]
   ),
   forward(
     "list_references",
@@ -444,12 +660,21 @@ const catalogue: ToolDef[] = [
   ),
   forward(
     "add_cube",
-    "Add a cube to the model. Coordinates are in Blockbench units. Cubes support `rotation` (degrees) and `inflate` (round/shrink without moving) — use them; flat axis-aligned boxes look robotic. For compound multi-axis angles, parent the cube to a rotated group instead. For anything with a left and a right: the model faces -Z, so its OWN right is +X — pass `side` and the tool will enforce it. Prefer add_cubes to build many cubes at once. Returns the created cube with uuid and resolved face UVs (paint onto those with paint_faces).",
+    "Add a cube to the model. Place it the way you think about it instead of hand-computing corners: `center`+`size`, or `attach` it to a face of an existing cube (`attach:{to:'torso', face:'front', at:[0,0.4], embed:0.2}` + `size` — it lands ON that surface, follows the target's rotation and bone, and never floats), or classic `from`/`to`. `mirror:true` also builds the twin on the other side (names get _right/_left). Cubes support `rotation` (degrees) and `inflate` (round/shrink without moving). The model faces -Z, so its OWN right is +X — pass `side` and the tool will enforce it. Coplanar faces it creates are fixed automatically. Prefer add_cubes for many cubes.",
     obj(
       {
         name: { type: "string" },
         from: vec3("Lower corner [x,y,z]."),
         to: vec3("Upper corner [x,y,z]."),
+        center: vec3("Centre [x,y,z] — use with `size` instead of from/to."),
+        size: vec3("Size [w,h,d] — with `center`, or with `attach` (in the target cube's own axes)."),
+        attach: {
+          type: "object",
+          description:
+            "Stick the cube onto a face of another cube: {to:'<cube name>', face:'front'|'back'|'left'|'right'|'top'|'bottom'|north/south/east/west/up/down, at:[a,b] position on that face from -1 to 1 (0,0 = centre; north/south faces: [x,y], east/west: [z,y], up/down: [x,z]), embed: how far it sinks in (default 0; 0.1-0.3 hides seams), offset:[x,y,z] extra shift}. Requires `size`. Carries the target's rotation/bone, so details on a rotated plate sit flush.",
+        },
+        mirror: { type: "boolean", description: "Also create the mirrored twin across the model's centre line (names get _right/_left from where each lands)." },
+        fix_z_fighting: FIX_Z,
         origin: vec3("Rotation pivot [x,y,z] (defaults to `from`)."),
         rotation: vec3("Rotation in degrees [x,y,z]. Single-axis is most reliable per cube."),
         inflate: { type: "number", description: "Inflate (+) or shrink (-) all faces in place — use for rounding/taper." },
@@ -469,7 +694,7 @@ const catalogue: ToolDef[] = [
             "Optional per-face setup, keyed by north/south/east/west/up/down. Each: {uv:[x1,y1,x2,y2], rotation, texture: name|uuid}.",
         },
       },
-      ["from", "to"]
+      []
     )
   ),
   forward(
@@ -488,7 +713,7 @@ const catalogue: ToolDef[] = [
   ),
   forward(
     "add_cubes",
-    "Create many cubes in one call — the efficient way to author a detailed model. BUDGET: a simple prop is 30-60 cubes, a standard mob/NPC 100-180, a hero model 180-300+; a humanoid built from under ~70 cubes is a draft, not a model (audit_complexity enforces this). Hand-computing [from,to] is what you are worst at, so use this for the primary masses and reach for the generators for the rest: add_hollow_volume (hoods/helmets/armour shells), generate_array (hems, scales, plates, teeth, rivets), extrude_chain (horns, tails, tentacles), add_wing (bat/dragon wings with a continuous membrane), voxelize_matrix (blades, emblems, flat detail). Pass `cubes`: an array where each item takes the same fields as add_cube ({name, from, to, origin, rotation, inflate, parent, side, box_uv, uv_offset, faces}). Build symmetric parts by emitting both the left side and its mirror (negate X, flip Y/Z rotation signs) in the same array, and tag each with side:'left'/'right' — the model faces -Z so its OWN right is +X, and the whole batch is validated before anything is created, so a mirrored limb fails loudly instead of silently. AVOID Z-FIGHTING: when cubes overlap, make one clearly penetrate the other (by >=0.1) and never align two faces to the exact same coordinate; stagger decorative pieces' depths. Returns all created cubes with their face UVs.",
+    "Create many cubes in one call — the efficient way to author a detailed model. BUDGET: a simple prop is 30-60 cubes, a standard mob/NPC 100-180, a hero model 180-300+; a humanoid built from under ~70 cubes is a draft, not a model (audit_complexity enforces this). Hand-computing [from,to] is what you are worst at, so use this for the primary masses and reach for the generators for the rest: add_hollow_volume (hoods/helmets/armour shells), generate_array (hems, scales, plates, teeth, rivets), extrude_chain (horns, tails, tentacles), add_wing (bat/dragon wings with a continuous membrane), voxelize_matrix (blades, emblems, flat detail). Pass `cubes`: an array where each item takes the same fields as add_cube ({name, from, to, center, size, attach, mirror, origin, rotation, inflate, parent, side, box_uv, uv_offset, faces}); `attach.to` may name a cube created earlier in the same array, so you can build a part and its details in one call. Use mirror:true instead of hand-mirroring. Build symmetric parts by emitting both the left side and its mirror (negate X, flip Y/Z rotation signs) in the same array, and tag each with side:'left'/'right' — the model faces -Z so its OWN right is +X, and the whole batch is validated before anything is created, so a mirrored limb fails loudly instead of silently. Coplanar faces created by the batch are fixed automatically (z_fight_fixed in the result); still make overlapping parts clearly penetrate each other (>=0.1). Returns all created cubes with their face UVs.",
     obj(
       {
         cubes: {
@@ -496,6 +721,7 @@ const catalogue: ToolDef[] = [
           description: "Array of cube specs (each like add_cube's args).",
           items: { type: "object" },
         },
+        fix_z_fighting: FIX_Z,
       },
       ["cubes"]
     )
@@ -506,6 +732,7 @@ const catalogue: ToolDef[] = [
     "DRAW a shape as a character matrix and get 3D cubes back — the fix for parts you cannot compute [from,to] for by hand. You are excellent at 2D pixel art and bad at 3D arithmetic, so describe the SILHOUETTE in rows of characters and this extrudes it. Universal: sword/scythe/axe blades, bows, horns, shield emblems, fins, flat wings, chevrons, keys, gears, plate patterns, tattered banner edges. `matrix` rows are top-to-bottom, ' ' and '.' are empty; every other character becomes cubes. Per character, `palette` sets {name (drives detail_cubes colour rules), depth (thickness in units), offset_z (shift along the depth axis — layer a rim in front of a core), inflate}. `plane` picks the projection: 'xy' front view (columns->+X, rows descend -Y, depth along +Z), 'xz' top view (columns->+X, rows go back-to-front, depth along +Y), 'yz' side view (columns->+Z with column 0 at the model's FRONT, rows descend -Y, depth along +X). `origin` is the grid's minimum corner. `merge_adjacent:true` merges runs of the same character across a row into one cube (far fewer cubes, same shape). Then pack_uv.",
     obj(
       {
+        fix_z_fighting: FIX_Z,
         matrix: strArr(
           "Rows of characters, top row first, e.g. ['..##..','.####.','######']. All rows should be the same length; short rows are padded with blanks."
         ),
@@ -544,6 +771,7 @@ const catalogue: ToolDef[] = [
     "Build a SHELL instead of a solid box — the fix for the single biggest 'AI model' tell, a monolithic cube where a hollow form belongs. Creates up to six walls of `wall_thickness` around an empty cavity, skipping every direction in `open_faces`. Universal: hoods (open 'north'+'down' so the face and neck show), helmets, masks, visors, eye sockets, breastplates, pauldrons, bracers, collars, cages, wheels, pipes, chimneys, crates, troughs. Faces are WORLD-relative — north=-Z (the model's front), south=+Z, east=+X, west=-X, up, down — and the model-relative words front/back/left/right/top/bottom are accepted too. The walls tile the shell exactly, so they never overlap or z-fight each other; anything you place INSIDE the cavity should still keep >=0.1 clearance from them. Returns the cavity bounds so you can fill it.",
     obj(
       {
+        fix_z_fighting: FIX_Z,
         bounds: {
           type: "object",
           description: "OUTER box of the shell: {from:[x,y,z], to:[x,y,z]}.",
@@ -569,6 +797,7 @@ const catalogue: ToolDef[] = [
     "Repeat one element along a line, around a ring, or over a grid — the fix for parts you would otherwise collapse into one flat box. Universal: torn/shingled hems on cloaks and skirts, scales, feathers, overlapping armour plates, teeth in a jaw, spikes along a spine, rivets, fence posts, chain links, ribs, tassels. `mode:'linear'` needs start+end, `'radial'` needs center+radii (an ellipse in XZ, elements turned to face outward by default), `'grid'` needs start+end plus counts (or count). `anchor` decides how each element sits on its point: 'center' (default), 'top' (element HANGS from the point — use for fringes), 'bottom' (stands on it — spikes), 'min'. `jitter` breaks the machine-regular look, `size_decay` grows/shrinks elements along the run (per-step delta in units, negative to taper), `rotation_range` {min,max} gives each element its own tilt, and `depth_stagger` alternates neighbours in depth so overlapping rows CANNOT z-fight — always pass 0.05-0.2 for shingled rows. `seed` makes the randomness repeatable. The result reports `z_fight_pairs`: elements whose faces ended up on the same plane anyway (a row where each element overlaps two others still lines up), with the fix to apply — act on it rather than leaving it for check_model.",
     obj(
       {
+        fix_z_fighting: FIX_Z,
         mode: { type: "string", enum: ["linear", "radial", "grid"], description: "Distribution (default 'linear')." },
         count: { type: "number", description: "How many elements (linear/radial; in grid mode it caps the total)." },
         element_size: vec3("Size of one element [width, height, depth] in units."),
@@ -611,6 +840,7 @@ const catalogue: ToolDef[] = [
     "Build a tapering, curving chain of segments — optionally one BONE per segment, so it can be animated. Universal: tentacles, horns, antlers, claws, curved tails, tusks, branches, snake bodies, hair braids, cables, antennae, whip links. The chain grows along `direction` from `base_origin`; each segment is `taper`-thinner than the last and each bone adds `curvature` degrees on top of its parent, so segment i sits at base_rotation + i x curvature and the whole thing sweeps into a curve. With `create_bones:true` (default) the segments nest as a bone chain — that is what gives a tail follow-through and a tentacle its whip; the rest pose is laid out straight and the bone rotations produce the curve. With `create_bones:false` the rotations are baked into the cubes and it cannot be animated (and single-axis-rotation formats such as java_block will not honour compound angles). Returns `tip`, the world position where the chain ends, so you can attach something there.",
     obj(
       {
+        fix_z_fighting: FIX_Z,
         segments: { type: "number", description: "Number of segments (default 4, max 64). 5-8 reads as a smooth curve." },
         base_origin: vec3("Where the chain starts [x,y,z] — the first joint."),
         segment_length: { type: "number", description: "Length of the first segment in units (default 4)." },
@@ -638,6 +868,7 @@ const catalogue: ToolDef[] = [
     "Build a complete bat / dragon / demon wing in ONE call: a bone chain <name>_arm -> <name>_forearm -> a fan of <name>_finger1..N bones, plus a CONTINUOUS MEMBRANE stretched between the fingers and back to the body. Use this instead of hand-placing rotated slabs — those always leave gaps, floating panels and z-fighting. The wing is laid out in one plane: every bone carries its rest angle as a rotation, every membrane panel is cut from one shared outline and parented to the bone it rides on, so edges meet exactly and the whole wing flaps as one piece (generate_animation {type:'fly'} drives it). Membrane is thin cubes by default in cube-only formats (GeckoLib, Bedrock, Java — animates everywhere) or a double-sided mesh where the format supports meshes. Angles are in degrees inside the wing plane, measured from pointing straight OUT of the body (0) toward `back` (horizontal plane) or `up` (vertical plane). Call once per side with the same numbers and `side` flipped — do not mirror_element a wing. Returns shoulder/elbow/wrist/finger_tips/membrane_attach world positions.",
     obj(
       {
+        fix_z_fighting: FIX_Z,
         side: { type: "string", enum: ["left", "right"], description: "The model's own side. Required; enforced against base_origin (the model's right is +X when it faces -Z)." },
         base_origin: vec3("Shoulder joint [x,y,z] where the wing leaves the body — usually on the upper back, a little off the centre line."),
         plane: {
@@ -677,8 +908,195 @@ const catalogue: ToolDef[] = [
   ),
 
   forward(
+    "add_cylinder",
+    "A ROUND part along a world axis — wheels, barrels, pillars, logs, cans, buttons, lenses, coins, drums — built correctly from rotated cubes: a solid regular polygon (sides 4-32; the bands' union is exactly the polygon, no star points, end caps never z-fight) or a hollow tube/ring (`inner_radius`). Never fake a wheel with one box. In animated formats it gets its own bone at the centre so it can spin.",
+    obj(
+      {
+        name: { type: "string" },
+        center: vec3("Centre [x,y,z]."),
+        radius: { type: "number", description: "Radius to the corners (default 2)." },
+        length: { type: "number", description: "Length along the axis (default 4)." },
+        axis: { type: "string", enum: ["x", "y", "z"], description: "Axis it runs along (default y — a pillar; x for an axle/wheel turning sideways)." },
+        sides: { type: "number", description: "Polygon sides (default 8, or 16 when radius >= 5). Java block models only rotate in 22.5 deg steps: use 8 or 16." },
+        inner_radius: { type: "number", description: "Make it a hollow tube/ring with this inner radius." },
+        phase: { type: "number", description: "Turn the polygon by this many degrees." },
+        inflate: { type: "number" },
+        parent: { type: "string", description: "Parent group name/uuid." },
+        bone: { type: "boolean", description: "Put it on its own bone at the centre (default true in animated formats when no parent is given)." },
+        fix_z_fighting: FIX_Z,
+      },
+      []
+    )
+  ),
+  forward(
+    "add_gear",
+    "A real GEAR on its own bone (pivot on the axle, ready to spin): teeth all round, a solid disc or a spoked rim + hub, and an axle. `mesh_with:{gear:'<other>', angle}` places it so its teeth interleave with an existing gear (centre distance, tooth count for a matching tooth size, and the half-tooth phase are computed) and records the ratio, so animate_mechanism turns them at the right speeds in opposite directions. Use it for clockwork, machines, engines, steampunk.",
+    obj(
+      {
+        name: { type: "string", description: "Unique gear/bone name (default 'gear')." },
+        center: vec3("Axle position [x,y,z] (ignored with mesh_with)."),
+        radius: { type: "number", description: "Radius to the tooth tips (default 5)." },
+        teeth: { type: "number", description: "Tooth count (default from the size; with mesh_with, computed to match the other gear's tooth size)." },
+        axis: { type: "string", enum: ["x", "y", "z"], description: "Axle direction (default z — facing the front)." },
+        thickness: { type: "number", description: "Thickness along the axle (default 2)." },
+        tooth_height: { type: "number" },
+        tooth_width: { type: "number" },
+        spokes: { type: "number", description: "Spokes for a rim+hub gear (default 4 when radius >= 7, else a solid disc)." },
+        hub_radius: { type: "number" },
+        rim_width: { type: "number" },
+        spoke_width: { type: "number" },
+        axle: { type: "boolean", description: "Add an axle (default true)." },
+        axle_radius: { type: "number" },
+        axle_length: { type: "number", description: "How far the axle sticks out beyond the gear in total (default 2)." },
+        phase: { type: "number", description: "Rotate the teeth by this many degrees." },
+        mesh_with: {
+          type: "object",
+          description: "{gear:'<existing gear name>', angle: where around it to sit in degrees (0 = toward +X/+Z, 90 = up), clearance: extra gap (default 0.15)}.",
+        },
+        parent: { type: "string" },
+        fix_z_fighting: FIX_Z,
+      },
+      []
+    )
+  ),
+  forward(
+    "add_pipe",
+    "A PIPE / tube / cable / handrail / exhaust through a list of points: round segments, fittings at the joints (box elbows or round collars) and flanges at the ends. Good for machines, plumbing, steampunk, sci-fi conduits.",
+    obj(
+      {
+        name: { type: "string" },
+        points: { type: "array", items: { type: "array", items: { type: "number" } }, description: "[[x,y,z], ...] at least 2 points." },
+        radius: { type: "number", description: "Pipe radius (default 1)." },
+        sides: { type: "number", description: "Polygon sides (default 8)." },
+        joints: { type: "string", enum: ["box", "round", "none"], description: "Fittings at the bends (default box)." },
+        flanges: { type: "boolean", description: "End flanges (default true)." },
+        inflate: { type: "number" },
+        parent: { type: "string" },
+        bone: { type: "boolean" },
+        fix_z_fighting: FIX_Z,
+      },
+      ["points"]
+    )
+  ),
+  forward(
+    "add_flare",
+    "A ring of panels that FLARES from a top ring to a bottom ring: SKIRTS (pleated, layered, tutus), dresses, CAPES and cloaks (arc_degrees ~200 at the back), coat tails, lampshades, bells, cone roofs, funnels, armour faulds. Each panel is tilted to the slope and turned to face outward, so it reads as one continuous round shell instead of a box. Elliptical radii [x, z] follow a body that is wider than deep. Hangs DOWN from `center` by `height`.",
+    obj(
+      {
+        name: { type: "string", description: "Name / bone name (default 'flare')." },
+        center: vec3("Centre of the TOP ring [x,y,z] (e.g. the waist)."),
+        top_radius: { oneOf: [{ type: "number" }, { type: "array", items: { type: "number" } }], description: "Top radius, or [x, z] for an ellipse (default 4)." },
+        bottom_radius: { oneOf: [{ type: "number" }, { type: "array", items: { type: "number" } }], description: "Bottom radius or [x, z] (default 6)." },
+        height: { type: "number", description: "How far it hangs down (default 6)." },
+        segments: { type: "number", description: "Panels around (default 12; 14-20 for a pleated skirt)." },
+        rows: { type: "number", description: "Rows down the height (1-8, default 1; 2-3 for a curved profile)." },
+        profile: { type: "string", enum: ["linear", "bell", "flare"], description: "Silhouette down the height (bell = rounded out at the top, flare = kicks out at the hem)." },
+        pleat: { type: "number", description: "Alternate panels in/out by this much — reads as pleats and prevents z-fighting (0.1-0.4)." },
+        overlap: { type: "number", description: "Panel width multiplier so neighbours overlap (default 1.12)." },
+        thickness: { type: "number", description: "Panel thickness (default 0.6)." },
+        arc_degrees: { type: "number", description: "How much of the circle (default 360; ~200 for a cape)." },
+        arc_center: { type: "string", description: "Where a partial arc is centred: 'back' (default), 'front', 'left', 'right', or degrees." },
+        start_degrees: { type: "number", description: "Explicit start angle (0 = model's right, 90 = back, 180 = left, 270 = front)." },
+        parent: { type: "string" },
+        bone: { type: "boolean", description: "Own bone at the top centre (default true) so it can sway." },
+        fix_z_fighting: FIX_Z,
+      },
+      []
+    )
+  ),
+  forward(
+    "add_hair",
+    "HAIR around a head cube, in one call, as layered geometry instead of a helmet: a cap + crown, a hairline band, tapered BANGS (straight/swept/parted/spiky) hanging over the forehead, side locks framing the face, long back strands, TAILS on swinging bone chains (ponytail, twin tails, pigtails) with ribbons/bows, an optional ahoge, a bun or spikes. Everything is named hair_* / ribbon_* so detail_cubes shades it with strands and a shine band. Styles: short, bob, long, ponytail, twin_tails, pigtails, spiky, bun — then override any part. Build the head cube first, then this, then texture and paint_face.",
+    obj(
+      {
+        head: { type: "string", description: "The head CUBE (the skull box) name/uuid (default 'head')." },
+        style: { type: "string", enum: ["short", "bob", "long", "ponytail", "twin_tails", "pigtails", "spiky", "bun"] },
+        name: { type: "string", description: "Name prefix / bone (default 'hair')." },
+        volume: { type: "number", description: "How far the hair stands off the skull (default ~12% of the head width)." },
+        length: { oneOf: [{ type: "number" }, { type: "string" }], description: "Back hair length: units, or none/chin/neck/shoulder/back/waist/hips." },
+        sides: { type: "number", description: "How far the side hair comes down, as a fraction of head height from the bottom (negative = past the jaw)." },
+        bangs: { type: "string", enum: ["straight", "swept", "parted", "spiky", "none"] },
+        bang_length: { type: "number", description: "Bang length as a fraction of head height (default 0.42; lower it if they cover the eyes)." },
+        bang_count: { type: "number" },
+        sidelocks: { type: "boolean" },
+        sidelock_length: { type: "number" },
+        tails: {
+          type: "array",
+          items: { type: "object" },
+          description: "[{side:'right'|'left'|'back', height:'high'|'mid'|'low'|y, length, size, segments, taper, direction:'down'|'up', curl, base_rotation, strands (1-5: extra locks fanning from the root — 3 for spiky anime tufts), ribbon: true|false|'bow'}] — replaces the style's tails. High side tails with direction 'up' grow from the top of the head near its corners.",
+        },
+        ahoge: { type: "boolean", description: "A single upright strand on top." },
+        bun: { type: "boolean" },
+        spikes: { type: "number" },
+        crown: { type: "boolean", description: "Rounding cube on top of the cap (default true)." },
+        seed: { type: "number" },
+        parent: { type: "string", description: "Bone to build under (default the head cube's bone)." },
+        fix_z_fighting: FIX_Z,
+      },
+      []
+    )
+  ),
+  forward(
+    "paint_face",
+    "Paint a FACE onto a head cube as proper pixel art in the face's own grid — upright as seen by someone facing the model, sized to the face: eyes with lash line, iris gradient, pupil and catchlights (anime), brows, blush, nose, mouth, in a chosen expression. The head is what people look at first and where AI models fail hardest (two black squares). Run after detail_cubes (it samples the skin colour). Styles: anime, cartoon, minecraft, beady, chibi.",
+    obj({
+      cube: { type: "string", description: "Head cube (default 'head')." },
+      face: { type: "string", description: "Which face (default 'front' = the face side)." },
+      style: { type: "string", enum: ["anime", "cartoon", "minecraft", "beady", "chibi"] },
+      expression: { type: "string", enum: ["neutral", "happy", "closed", "sleepy", "shy", "sad", "angry", "surprised", "worried"] },
+      eye_color: { type: "string" },
+      lash_color: { type: "string" },
+      sclera_color: { type: "string" },
+      eye_width: { type: "number", description: "Pixels." },
+      eye_height: { type: "number", description: "Pixels." },
+      eye_gap: { type: "number", description: "Pixels between the eyes." },
+      eye_margin: { type: "number" },
+      eye_y: { type: "number", description: "Top row of the eyes, pixels from the top of the face." },
+      highlight: { type: "boolean" },
+      brows: { type: "boolean" },
+      brow_color: { type: "string" },
+      brow_offset: { type: "number" },
+      blush: { oneOf: [{ type: "boolean" }, { type: "string" }], description: "true or a colour." },
+      nose: { type: "string", enum: ["dot", "none"] },
+      mouth: { type: "string", enum: ["small", "line", "smile", "frown", "open", "cat", "none"] },
+      mouth_y: { type: "number" },
+      mouth_color: { type: "string" },
+      skin: { type: "string", description: "Skin colour (default: sampled from the texture)." },
+      texture: { type: "string" },
+    })
+  ),
+  forward(
+    "fix_z_fighting",
+    "Find every pair of faces that share a plane and overlap (world space — rotations, bones and inflate included) and fix them by growing the smaller cube of each pair a hair outward with inflate (UVs untouched), repeating until clean. Reports what was nudged and any exact duplicates (delete those). Most tools already do this for what they create; run it after manual edits or imports.",
+    obj({
+      cubes: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }], description: "Only fix pairs involving these cubes (default all)." },
+      step: { type: "number", description: "Inflate step (default 0.05)." },
+    })
+  ),
+  forward(
+    "animate_mechanism",
+    "Loop-perfect MECHANICAL motion in one call: spinning gears/wheels/fans (a gear `driven_by` another gets the right ratio from the tooth counts and turns the opposite way; link:'shaft' = same speed and direction), pistons sliding, levers swinging, lights pulsing, hovering parts bobbing, motors vibrating. Spins are keyed every quarter turn with linear interpolation so all exporters play them the same; fractional ratios stretch the loop until every part closes seamlessly.",
+    obj(
+      {
+        parts: {
+          type: "array",
+          items: { type: "object" },
+          description:
+            "[{bone, type:'spin'|'slide'|'swing'|'bob'|'pulse'|'vibrate', axis:'x'|'y'|'z', turns (spin per loop), rpm, driven_by:'<bone>', link:'mesh'|'shaft', ratio, distance (slide/bob/vibrate), angle (swing), amount (pulse), frequency (cycles per loop), phase (0-1)}]. Gears from add_gear know their axis.",
+        },
+        length: { type: "number", description: "Loop length in seconds (default 2)." },
+        name: { type: "string", description: "Animation name (default animation.<model>.working)." },
+        state: { type: "string", description: "Used in the default name (default 'working')." },
+        loop: { type: "string", enum: ["loop", "once", "hold"] },
+        replace: { type: "boolean", description: "Replace an existing animation of that name (default true)." },
+        fit_loop: { type: "boolean", description: "Stretch the loop so fractional gear ratios close seamlessly (default true)." },
+      },
+      ["parts"]
+    )
+  ),
+  forward(
     "check_model",
-    "Audit the model for problems that make results look broken: untextured faces (the 'gaps'), zero-area or out-of-bounds UVs, degenerate cube sizes, cubes not parented to a bone in animated formats, and Z-FIGHTING (coplanar_overlap — two faces on the same plane that flicker/clip, the 'two squares inside one another'). Run this after building and before/after texturing, then fix what it reports (for coplanar_overlap, nudge one cube by >=0.1 so the faces aren't coplanar). Returns a grouped issue list.",
+    "Audit the model for problems that make results look broken, all in WORLD space (rotations, bones and inflate included): Z-FIGHTING (coplanar_overlap / duplicate_cube — faces on one plane that flicker; run fix_z_fighting), FLOATING parts (touch nothing — a belt hovering off the waist), HIDDEN cubes (fully inside another — invisible, wasted), off_pixel_grid / texel_density_mismatch (stretched or uneven pixels), untextured faces, zero-area or out-of-bounds UVs, degenerate sizes, cubes without a bone in animated formats, and left/right mistakes. Per-face issues are grouped per cube. Run after each build pass, then inspect_model to SEE the spots.",
     obj({})
   ),
   forward(
@@ -699,8 +1117,9 @@ const catalogue: ToolDef[] = [
   ),
   forward(
     "pack_uv",
-    "Shelf-pack the box UVs so every cube gets its own region of the texture. REQUIRED before texturing a box_uv model (GeckoLib/Bedrock): newly created cubes all sit at uv_offset [0,0] and otherwise paint onto the same pixels. Re-run after adding or resizing cubes. Auto-grows the texture (preserving paint) if the layout overflows.",
+    "Pack the UVs so every cube gets its own pixels. REQUIRED before texturing (new cubes all sit at uv [0,0] and would paint onto the same pixels); re-run after adding or resizing cubes. Mode auto (default): whole-unit cubes keep box UV; cubes thinner than 1 unit or off the pixel grid (gear teeth, hair strands, lace, rotated bands) get per-face UV with whole-pixel faces where the format allows it — box UV would collapse them to zero width or stretch them. Auto-grows the texture (preserving paint) if the layout overflows.",
     obj({
+      mode: { type: "string", enum: ["auto", "box", "faces"], description: "auto (default), force box UV, or force per-face UV." },
       cubes: {
         oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
         description: "'all' (default), or specific cube names/uuids.",
@@ -920,8 +1339,22 @@ const catalogue: ToolDef[] = [
   ),
   forward(
     "detail_cubes",
-    "SMOOTH base texturing — the @volmur/Hytale look. Assigns the texture to every chosen face (no untextured 'gaps'), then per face bakes a soft vertical gradient in the region colour + gentle directional shading (top lighter, underside darker) + a SUBTLE low-contrast mottle, and finally a 3x3 box blur per UV island (the 'smooth brush'). Run pack_uv FIRST, then this right after create_texture, then paint_faces for crisp features. Avoids the dirty/noisy/grid look (no hard edge outline, low noise by default). Cubes named *_core/*_glow are filled bright (emissive read).",
+    "The texturing engine. Every pixel is computed from the 3D point it lands on: hue-shifted light (cool shadows, warm lights — not a brightness multiplier), ambient occlusion where parts meet or tuck under others, 1px bevel highlights on edges, darkening toward the ground, and per-MATERIAL surface detail (cloth folds, hair strands + an anime shine band, metal sheen + scratches, wood grain, stone cracks, leather stitching, scales, glowing emissive). Patterns are laid out in world space so they continue across neighbouring cubes: plaid/tartan, stripes, checker, dots, panels (+rivets), grille/vents, hazard, bricks, planks, scales, trim/lace borders (solid, zigzag, dashed) on chosen edges, gradients, speckle. Rules match cube names (regex); colours may be palette keys from make_palette ('$hair', '$skirt.shadow'). Run pack_uv and create_texture first; re-run after changing geometry (the shading comes from it). Then paint_face for the face and paint_faces for any other crisp marking. style:'smooth' gives the old soft-gradient look.",
     obj({
+      materials: {
+        type: "array",
+        items: { type: "object" },
+        description:
+          "Rules, first match wins: [{match:'^hair', material:'hair', color:'$hair'}, {match:'skirt', material:'cloth', color:'#b3262d', pattern:[{type:'plaid', color:'#1b1b1f', size:4}, {type:'lace', edges:'bottom', width:2, style:'zigzag', color:'#ffffff'}]}, {match:'buckle', material:'metal', color:'#c9cdd2'}]. material: matte, skin, cloth, leather, metal, gold, wood, stone, hair, fur, plastic, rubber, glass, crystal, foliage, bone, scales, emissive (guessed from the cube name when omitted). Per-rule overrides: contrast, bevel, noise, hue_shift, shadow_hue, light_hue, shadow_sat, ao, folds, strands, shine, sheen, scratches, grain, cracks, stitch, emissive. Pattern fields: type, color, color2, size, band, line, twill, spacing, rivets, rivet_color, width, edges ('all'|'top'|'bottom'|'side'), style ('solid'|'zigzag'|'dashed'), direction, start, strength, amount, density, offset, space ('world'|'face').",
+      },
+      style: { type: "string", enum: ["painted", "smooth"], description: "painted (default, the engine) or smooth (legacy soft gradients)." },
+      finish: { type: "string", enum: ["painted", "pixel", "cel"], description: "painted = smooth ramps (default); pixel = quantised to a few ordered-dithered tones (crisp pixel art); cel = 3 hard bands (anime/toon)." },
+      ao: { type: "number", description: "Ambient occlusion strength 0..1.5 (default 0.55)." },
+      bevel: { type: "number", description: "Edge highlight/shadow strength 0..2 (default 1)." },
+      light: vec3("Light direction (default [0, 1, -0.5]: from above and in front, so both sides of a model that turns in game get the same light)."),
+      ground_dark: { type: "number", description: "Darken toward the lowest point 0..0.4 (default 0.1)." },
+      vary: { type: "number", description: "Per-cube tone variation 0..0.1 (default 0.035) so identical parts do not look stamped." },
+      seed: { type: "number", description: "Noise seed (same seed = same texture)." },
       cubes: {
         oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
         description: "'all' (default), a single cube name/uuid, or an array of names/uuids to texture.",
@@ -930,7 +1363,7 @@ const catalogue: ToolDef[] = [
       base: { type: "string", description: "Default base color, e.g. '#6e4a2b'. Used where no `colors` rule matches." },
       colors: {
         type: "array",
-        description: "Region colour map by cube name: [{match:'leg|paw', color:'#5a3d22'}, ...]. `match` is a regex tested case-insensitively against the cube name; first hit wins. The key to matching a reference palette and not making everything one colour.",
+        description: "Shorthand colour rules [{match:'leg|paw', color:'#5a3d22'}, ...] (merged after `materials`). Colours may be palette keys ('$fur').",
         items: { type: "object" },
       },
       noise: { type: "number", description: "Mottle amount 0..1 (default 0.06 — keep it LOW for the smooth look)." },
@@ -1150,7 +1583,7 @@ const catalogue: ToolDef[] = [
   {
     name: "screenshot_views",
     description:
-      "Capture several camera angles in ONE call so you can see the whole model and catch problems (gaps, wrong rotations, missing detail, asymmetry) from every side. Views are named from the MODEL's point of view — 'front' shows its FACE (not the +Z side), 'left' is the side its left arm is on — and each image is stamped with which edge is the model's right, because front views are mirrored. Defaults to front_right/front/left/back. Do this after each modeling/texturing pass, then request_review so the USER confirms it rather than you.",
+      "Capture several camera angles in ONE call — PLUS close-ups of the spots where something is wrong or most likely to be wrong (z-fighting, floating parts, hidden cubes, left/right mix-ups, then the face, hands, feet, joints and gear contacts), each framed tight, with what stands in front clipped away and the cubes involved outlined and labelled. Views are named from the MODEL's point of view — 'front' shows its FACE, 'left' is the side its left arm is on — and each image is stamped with which edge is the model's right, because front views are mirrored. Defaults to front_right/front/left/back + up to 4 close-ups. STUDY the close-ups: they are where models break. Do this after each pass, then request_review so the USER confirms it.",
     inputSchema: obj({
       views: {
         type: "array",
@@ -1161,13 +1594,39 @@ const catalogue: ToolDef[] = [
       width: { type: "number" },
       height: { type: "number" },
       annotate: { type: "boolean", description: "Stamp view/side labels onto each image (default true)." },
+      inspect: { type: "boolean", description: "Append close-ups of problem / detail spots (default true)." },
+      inspect_limit: { type: "number", description: "How many close-ups (default 4, max 8). inspect_model shows more." },
     }),
     handler: async (args) => {
       const res: any = await callBlockbench("screenshot_views", args);
+      const extra = [res.inspected?.length ? `Close-ups: ${res.inspected.join(" || ")}` : "", res.more_problems || ""].filter(Boolean).join("\n");
       return [
-        { type: "text", text: `Captured ${res.count} view(s). ${res.orientation}` },
+        { type: "text", text: `Captured ${res.count} view(s). ${res.orientation}${extra ? "\n" + extra : ""}` },
         ...shotBlocks(res.shots),
       ];
+    },
+  },
+  {
+    name: "inspect_model",
+    description:
+      "Close-up screenshots of the places models actually go wrong, found automatically: z-fighting and duplicate cubes, floating parts, hidden (fully buried) cubes, left/right mix-ups — then the detail spots worth checking every time (the face, each hand and foot, limb joints, gear contacts). Each shot frames the spot tight, clips away whatever is in front of it (x-ray) and outlines the cubes involved with their names, with a caption saying what is wrong and how to fix it. Also aim it yourself: `cubes` (names) or `at` [x,y,z]. Use it after every build pass and before texturing; whole-body screenshots hide all of this.",
+    inputSchema: obj({
+      limit: { type: "number", description: "Max close-ups (default 8, max 16)." },
+      problems_only: { type: "boolean", description: "Only real problems, skip the face/hands/joints detail spots." },
+      kinds: strArr("Only these spot kinds: z_fighting, floating, sides, hidden, details."),
+      cubes: strArr("Also frame these cubes (names/uuids) first."),
+      at: vec3("Also frame this model-space point first."),
+      size: { type: "number", description: "With `at`: how big an area to frame (default 4 units)." },
+      view: { type: "string", description: "With cubes/at: which side to look from (default front_right)." },
+      xray: { type: "boolean", description: "Clip geometry in front of the spot (default true)." },
+      isolate: { type: "boolean", description: "Hide cubes far from the spot (default false)." },
+      zoom: { type: "number", description: "Zoom factor, >1 closer (default 1)." },
+      width: { type: "number" },
+      height: { type: "number" },
+    }),
+    handler: async (args) => {
+      const res: any = await callBlockbench("inspect_model", args);
+      return shotsResult(res, `${res.count} close-up(s); ${res.problem_spots} problem spot(s) found.`);
     },
   },
 

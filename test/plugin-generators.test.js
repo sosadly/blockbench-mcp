@@ -611,16 +611,24 @@ test("audit_complexity defaults its budget from the rig it can see", () => {
   assert.equal(commands.audit_complexity().target, "character", "a rig means a character budget");
 });
 
-test("generate_array reports z-fighting it could not avoid, and stays quiet when clean", () => {
+test("generate_array fixes its own z-fighting, and only reports it when told not to fix", () => {
   // Elements 2.4 wide spaced 1 apart overlap two neighbours each, so alternating
   // the depth is not enough: i and i+2 line up again.
-  const dense = loadPlugin().commands.generate_array({
+  const row = {
     mode: "linear", count: 8, element_size: [2.4, 1.6, 0.9],
     start: [-4, 12, 2.6], end: [4, 12, 2.6], distribution: "cells", depth_stagger: 0.08,
-  });
-  assert.ok(dense.z_fight_pairs > 0, "a triple-overlapping row should be reported");
-  assert.match(dense.z_fight_hint, /jitter|element_size|rotation_range/);
-  assert.ok(dense.z_fight_examples.length > 0);
+  };
+  const fixed = loadPlugin();
+  const dense = fixed.commands.generate_array(row);
+  assert.ok(dense.z_fight_fixed && dense.z_fight_fixed.pairs_found > 0, "the overlap is found");
+  assert.ok(dense.z_fight_fixed.cubes_nudged > 0, "and fixed by nudging cubes");
+  assert.equal(dense.z_fight_pairs, undefined, "nothing left to report after the fix");
+  assert.ok(fixed.Cube.all.some((c) => c.inflate > 0), "the fix is an inflate, not a move");
+
+  const reportOnly = loadPlugin().commands.generate_array({ ...row, fix_z_fighting: false });
+  assert.ok(reportOnly.z_fight_pairs > 0, "a triple-overlapping row should be reported");
+  assert.match(reportOnly.z_fight_hint, /jitter|element_size|rotation_range/);
+  assert.ok(reportOnly.z_fight_examples.length > 0);
 
   // One element per step, staggered: nothing shares a plane.
   const clean = loadPlugin().commands.generate_array({
@@ -628,6 +636,7 @@ test("generate_array reports z-fighting it could not avoid, and stays quiet when
     start: [-10, 12, 2.6], end: [10, 12, 2.6], depth_stagger: 0.12,
   });
   assert.equal(clean.z_fight_pairs, undefined, "a clean row must not raise a warning");
+  assert.equal(clean.z_fight_fixed, undefined, "and must not be touched");
 });
 
 test("a hollow shell and a voxelized matrix are clean by construction", () => {

@@ -1150,6 +1150,76 @@ function boxUVFootprint(cube) {
 	return { w: Math.max(1, 2 * (w + d)), h: Math.max(1, h + d) };
 }
 
+const PACK_FACE_DIMS = { north: [0, 1], south: [0, 1], east: [2, 1], west: [2, 1], up: [0, 2], down: [0, 2] };
+
+/**
+ * Which cubes can keep box UV. Box UV floors each size to whole UV units, so a
+ * 0.6-wide tooth or hair strand gets a ZERO-width texture strip and can never
+ * be painted. In formats that allow per-face UV those cubes switch to it.
+ */
+function uvModeFor(cube, mode, ppu) {
+	const perFaceAllowed = !Format.box_uv || !!Format.optional_box_uv;
+	if (mode === 'box') return 'box';
+	if (mode === 'faces') return perFaceAllowed ? 'faces' : 'box';
+	if (!Format.box_uv) return 'faces';
+	if (!perFaceAllowed) return 'box';
+	const s = [0, 1, 2].map((i) => Math.abs(cube.to[i] - cube.from[i]));
+	// Thin (would collapse) or off the pixel grid (would stretch unevenly).
+	const k = ppu || 1;
+	return s.some((v) => v > 0 && (v < 0.999 || Math.abs(v * k - Math.round(v * k)) > 0.02)) ? 'faces' : 'box';
+}
+
+/**
+ * Pack cubes into the texture so no two share pixels. Box-UV cubes take their
+ * usual 2(w+d) x (h+d) footprint; per-face cubes get one whole-pixel rect per
+ * face (a sub-pixel face still gets 1 pixel), laid out in a strip.
+ */
+function packUV(cubes, texW, pad, mode, ppu) {
+	pad = pad == null ? 1 : pad;
+	ppu = ppu || 1;
+	const items = cubes.filter((c) => c instanceof Cube).map((c) => {
+		const m = uvModeFor(c, mode, ppu);
+		if (m === 'box') {
+			const f = boxUVFootprint(c);
+			return { c, m, w: Math.ceil(f.w * ppu), h: Math.ceil(f.h * ppu) };
+		}
+		const s = [0, 1, 2].map((i) => Math.abs(c.to[i] - c.from[i]));
+		const rects = Object.keys(PACK_FACE_DIMS).filter((d) => c.faces[d]).map((d) => {
+			const [a, b] = PACK_FACE_DIMS[d];
+			return { d, w: Math.max(1, Math.ceil(s[a] * ppu - 0.02)), h: Math.max(1, Math.ceil(s[b] * ppu - 0.02)) };
+		});
+		return { c, m, rects, w: rects.reduce((t, r) => t + r.w, 0), h: Math.max(...rects.map((r) => r.h)) };
+	}).sort((a, b) => b.h - a.h);
+	const texPx = texW * ppu;
+	const padPx = Math.max(0, Math.round(pad * ppu));
+	let x = 0, y = 0, rowH = 0, maxX = 0;
+	let box = 0, faces = 0;
+	for (const it of items) {
+		if (x + it.w + padPx > texPx && x > 0) { x = 0; y += rowH + padPx; rowH = 0; }
+		if (it.m === 'box') {
+			it.c.box_uv = true;
+			it.c.uv_offset = [x / ppu, y / ppu];
+			if (it.c.mapAutoUV) it.c.mapAutoUV();
+			box++;
+		} else {
+			it.c.box_uv = false;
+			it.c.autouv = 0;
+			let fx = x;
+			for (const r of it.rects) {
+				const f = it.c.faces[r.d];
+				f.uv = [fx / ppu, y / ppu, (fx + r.w) / ppu, (y + r.h) / ppu];
+				f.rotation = 0;
+				fx += r.w;
+			}
+			faces++;
+		}
+		x += it.w + padPx;
+		rowH = Math.max(rowH, it.h);
+		maxX = Math.max(maxX, x);
+	}
+	return { packed: items.length, box_uv: box, per_face: faces, used: [Math.ceil(maxX / ppu), Math.ceil((y + rowH) / ppu)] };
+}
+
 /**
  * Shelf-pack the box UV of the given cubes so no two share the same pixels.
  * Sets each cube's uv_offset and recomputes its 6 face UVs. Returns the used
@@ -1527,122 +1597,128 @@ function setMeshFaceUV(mesh, face, rect) {
 
 const MODELING_GUIDE = [
 	'BLOCKBENCH MODELING PLAYBOOK — read before building any model. Other topics:',
-	'get_guide {topic:"detailing"|"orientation"|"rigging"|"texturing"|"vfx"|"animation"|',
-	'"review"|"reference"}. Read "detailing" for the cube budget and the 4-layer doctrine',
-	'before anything with a costume, armour, cloth or a weapon. If the model will be animated, read "rigging" BEFORE placing cubes,',
-	'and "orientation" before anything that has a left and a right.',
+	'get_guide {topic:"character"|"mechanism"|"detailing"|"inspection"|"orientation"|',
+	'"rigging"|"texturing"|"vfx"|"animation"|"review"|"reference"}. Characters: read',
+	'"character". Machines, gears, vehicles: read "mechanism". Animated: read "rigging"',
+	'BEFORE placing cubes. Anything with a left and a right: "orientation".',
 	'',
 	'GOLDEN WORKFLOW (loop it, do not one-shot):',
-	'  get_reference (look at what you must match) -> get_status -> plan bones &',
-	'  proportions -> add_groups -> add_cubes -> compare_reference (SCORE the silhouette)',
-	'  -> fix the biggest delta -> compare_reference again ... THEN pack_uv -> create_texture',
-	'  -> detail_cubes -> paint_faces -> screenshot_views -> check_model -> FIX -> repeat.',
+	'  find_references (known subject? ALWAYS) -> load 2-4 -> get_reference / zoom_reference',
+	'  -> make_palette -> plan bones & proportions -> add_groups / create_rig -> add_cubes',
+	'  + shape tools -> check_model + inspect_model (FIX) -> compare_reference (SCORE)',
+	'  -> fix the biggest delta -> repeat ... THEN pack_uv -> create_texture -> detail_cubes',
+	'  -> paint_face / paint_faces -> screenshot_views (close-ups included) -> FIX -> repeat.',
 	'Do at least 2-3 passes. The first pass is NEVER good enough — plan to redo it.',
 	'',
-	'0. GROUND YOURSELF IN THE REFERENCE. If a reference image was provided (dropped in',
-	'   the MCP Copilot panel, or via load_reference), call get_reference and LOOK at it.',
-	'   Then build, and use compare_reference EVERY pass — it renders your model from the',
-	'   reference angle and returns a hard match_percent (silhouette IoU) plus a side-by-',
-	'   side overlay. Do not trust your own "looks close" — trust the number. See',
-	'   get_guide {topic:"reference"}.',
+	'0. GROUND YOURSELF IN REFERENCES. If the subject exists outside this chat (a named',
+	'   character, creature, franchise item, vehicle, building, product), find_references',
+	'   first — even if the user gave one image you still need the back, the sides and',
+	'   the small parts. Load the clearest full views, study them, zoom into details, and',
+	'   build the palette from them. compare_reference every pass; trust the number.',
 	'',
 	'1. SILHOUETTE FIRST. Build the grey shape and compare_reference it BEFORE texturing.',
-	'   A great texture cannot rescue wrong proportions. Match the reference silhouette:',
-	'   overall stance, head size/position, limb length. Aim for match_percent >= 85.',
+	'   A great texture cannot rescue wrong proportions. Aim for match_percent >= 85.',
 	'',
-	'2. PART COUNT & DETAIL. BUDGET: simple prop 30-60 cubes, standard mob/NPC 100-180,',
-	'   hero/boss 180-300+. A humanoid under ~70 cubes is a draft, not a model, and does',
-	'   NOT go to texturing — audit_complexity is the gate and it says so. Break every',
-	'   limb into 3 segments, give the head a separate snout/brow/jaw, and build in',
-	'   LAYERS: primary mass, then secondary volumes standing 0.3-0.8 proud of it, then',
-	'   fringes and silhouette breakers, then 1x1 micro-detail. Do not hand-compute',
-	'   hundreds of boxes: add_hollow_volume (shells: hoods, helmets, armour),',
-	'   generate_array (rows: hems, scales, plates, teeth, rivets), extrude_chain (horns,',
-	'   tails, tentacles), voxelize_matrix (blades, emblems, flat detail from a character',
-	'   grid). Full doctrine: get_guide {topic:"detailing"}.',
+	'2. DETAIL, BUT OPTIMISED. Spend cubes on what the eye sees: the face, hands, the',
+	'   silhouette edge, the costume\'s layers, trims and fastenings. A humanoid under ~70',
+	'   cubes is a draft; a detailed character is 150-350. But every cube must be VISIBLE',
+	'   and must read as its own thing: never bury cubes inside others (check_model flags',
+	'   hidden_cube), merge what reads as one surface into one cube, and do not stack',
+	'   decorative cubes that nobody can tell apart. Details live on the outside.',
 	'',
-	'3. ROTATION & TAPER make shapes organic. Cubes AND bones take rotation:[x,y,z].',
-	'   - A single cube rotates cleanly on ONE axis; for a compound angle put it in a',
-	'     GROUP and rotate the group, or nest groups. Build each limb as a bone at the',
-	'     JOINT origin and rotate the bone to pose it.',
-	'   - inflate (small +/-) rounds/shrinks a cube in place. Taper limbs by shrinking',
-	'     each segment.',
-	'   - A cube rotated 45° reads as a crystal/diamond/blade — use this for non-boxy',
-	'     shapes in cube formats. For true non-cuboid shapes use add_mesh.',
+	'3. PLACE PARTS THE WAY YOU THINK ABOUT THEM. Hand-computing [from,to] is where cube',
+	'   placement goes wrong. add_cube(s) takes:',
+	'   - center + size,',
+	'   - attach:{to:"torso", face:"front", at:[0, 0.4], embed:0.2} + size — the part lands',
+	'     ON that face, follows the target\'s rotation and bone, and never floats,',
+	'   - mirror:true — builds the twin on the other side, named _right/_left.',
+	'   attach.to may name a cube created earlier in the same add_cubes call, so a part and',
+	'   all its buttons/buckles/straps go in one call.',
 	'',
-	'3b. AVOID Z-FIGHTING / CLIPPING (the flickering "two squares inside one another").',
-	'   It happens when two faces sit on the SAME plane at the same depth. Rules:',
-	'   - When two cubes overlap, make one clearly PENETRATE the other (by >=0.1, ideally',
-	'     ~0.5) so no faces are coplanar — never align two faces to the exact same coord.',
-	'   - Decorative pieces (leaves, scales, plates, fur, trim) must NOT sit flush on a',
-	'     surface: push each out by a small UNIQUE amount and stagger neighbours\' depths',
-	'     so no two share a plane. Vary by 0.05-0.2 between adjacent pieces.',
-	'   - Two billboard PLANES must never share the exact same position — offset by >=0.1.',
-	'   - check_model reports `coplanar_overlap` pairs; fix every one by nudging a cube.',
+	'4. USE THE SHAPE TOOLS — do not fake shapes with one box:',
+	'   round parts (wheels, barrels, pillars, lenses) ... add_cylinder (solid or tube)',
+	'   gears + meshing gear trains .................... add_gear {mesh_with}',
+	'   pipes, cables, rails ........................... add_pipe',
+	'   skirts, capes, dresses, lampshades, roofs ...... add_flare',
+	'   hair (bangs, side locks, tails, ribbons) ...... add_hair',
+	'   shells with a cavity (hoods, helmets) .......... add_hollow_volume',
+	'   rows / rings / grids of parts .................. generate_array',
+	'   horns, tails, tentacles, braids ................ extrude_chain',
+	'   wings with a membrane .......................... add_wing',
+	'   flat silhouettes (blades, emblems) ............. voxelize_matrix',
 	'',
-	'4. SYMMETRY. Build one side, then mirror_element {axis:"x"} (or emit the mirror in',
-	'   the same add_cubes call: negate X of from/to, swap so from<to, negate Y/Z',
-	'   rotation signs). Keep paired bones named *_left / *_right.',
+	'5. ROTATION & TAPER make shapes organic. Cubes AND bones take rotation:[x,y,z].',
+	'   A cube rotates cleanly on ONE axis; for compound angles rotate a GROUP. Pose limbs',
+	'   by rotating the bone at the joint. inflate rounds/shrinks a cube in place.',
 	'',
-	'5. TEXTURE SMOOTH, not flat. pack_uv FIRST (box UV does not auto-pack), then',
-	'   detail_cubes for a smooth shaded base on every face (no gaps), then paint_faces',
-	'   for crisp features. See get_guide {topic:"texturing"}.',
+	'6. Z-FIGHTING is handled for you: every building tool fixes the coplanar faces it',
+	'   creates (z_fight_fixed in the result) and fix_z_fighting cleans up after manual',
+	'   edits. Still let overlapping parts clearly penetrate (>=0.1) so they read as',
+	'   layered, and stagger decorative rows.',
 	'',
-	'6. REVIEW HONESTLY. screenshot_views every pass; check_model for untextured faces /',
-	'   bad UVs / unparented cubes / left-right mistakes. If a screenshot looks wrong,',
-	'   FIX it — never call a visible flaw "acceptable" or "close enough".',
+	'7. TEXTURE WITH MATERIALS. pack_uv, create_texture (2-4 px per unit for characters),',
+	'   detail_cubes with material rules + patterns + palette colours, paint_face for the',
+	'   face. See get_guide {topic:"texturing"}.',
 	'',
-	'7. THEN ASK THE USER. Your own opinion of your own screenshot is not verification.',
-	'   At the end of a blockout, a texture pass or an animation, call request_review —',
-	'   it shows the user labelled renders inside Blockbench and waits for their verdict',
-	'   before you continue. See get_guide {topic:"review"}.',
+	'8. INSPECT, then FIX. check_model lists problems; inspect_model and screenshot_views',
+	'   show CLOSE-UPS of the problem spots and of the face, hands, joints — outlined and',
+	'   x-rayed. Never call a visible flaw "acceptable". See {topic:"inspection"}.',
 	'',
-	'8. LEFT AND RIGHT are the model\'s own, not the viewer\'s: the model faces -Z, so its',
-	'   RIGHT is +X and a front-view render shows it MIRRORED. Pass side:"left"/"right"',
-	'   to add_cube(s)/add_group and let the tool police it; verify with check_sides.',
-	'   See get_guide {topic:"orientation"}.',
+	'9. THEN ASK THE USER with request_review — your opinion of your own render is not',
+	'   verification. See get_guide {topic:"review"}.',
 	'',
-	'Animation formats (GeckoLib/Bedrock): every cube must live under a bone; bone',
-	'origins must sit at the real joint; limbs need 3 segments so elbows and knees can',
-	'bend (create_rig does all of this). GeckoLib store id "geckolib", format',
-	'"geckolib_model". Meshes do NOT export to GeckoLib/Java — use rotated cubes there.',
+	'10. LEFT AND RIGHT are the model\'s own: it faces -Z, so its RIGHT is +X and a front',
+	'    render shows it MIRRORED. Pass side:"left"/"right" (or mirror:true) and let the',
+	'    tool police it; verify with check_sides.',
+	'',
+	'Animation formats (GeckoLib/Bedrock): every cube under a bone, bone origins on the',
+	'real joints, limbs in 3 segments (create_rig does this). Meshes do NOT export to',
+	'GeckoLib/Java — use rotated cubes there. Java block models rotate one axis in 22.5',
+	'degree steps only.',
 ].join('\n');
 
 const TEXTURING_GUIDE = [
-	'BLOCKBENCH TEXTURING PLAYBOOK — the smooth, Hytale/@volmur look (not dirty/noisy).',
+	'BLOCKBENCH TEXTURING PLAYBOOK — painted, readable, consistent.',
 	'',
-	'ORDER: pack_uv -> create_texture -> detail_cubes (smooth base) -> paint_faces',
-	'(crisp features) -> get_texture to inspect -> fix.',
+	'ORDER: make_palette -> pack_uv -> create_texture -> detail_cubes (materials, patterns)',
+	'-> paint_face (heads) -> paint_faces (other crisp marks) -> screenshot_views -> fix.',
 	'',
-	'1. PACK UV FIRST. New box-UV cubes all sit at uv_offset [0,0] and share the same',
-	'   pixels. Call pack_uv before painting and again after adding/resizing cubes, or',
-	'   every face paints onto the same spot. It auto-grows the texture if needed.',
+	'1. PALETTE FIRST. make_palette from the reference (regions:[{name:"hair", x, y}, ...]',
+	'   pointed at flat-lit spots) or from the text brief (colors / base_color + scheme +',
+	'   mood). Then use "$hair", "$hair.shadow", "$hair.light" as colours — no guessed hex.',
 	'',
-	'2. SIZE. 64px for simple, 128px typical, 256px for very detailed. Square.',
+	'2. PACK UV. pack_uv before painting and after any geometry change. Thin or off-grid',
+	'   cubes get per-face UV automatically so every face has real pixels.',
 	'',
-	'3. SMOOTH BASE COAT — detail_cubes. It bakes, per face: a soft vertical gradient in',
-	'   the base colour + gentle directional shading (top lighter, underside darker) +',
-	'   a SUBTLE low-contrast mottle, then a 3x3 box blur per UV island (the "smooth',
-	'   brush"). This is the difference between good and bad textures. Tips:',
-	'   - Use the `colors` map to colour regions by cube name, e.g.',
-	'     colors:[{match:"leg|paw",color:"#5a3d22"},{match:"belly",color:"#3a2a18"}].',
-	'     Bodies/limbs are often the SAME tone as the head with darker extremities —',
-	'     do not default everything to one brown.',
-	'   - Keep noise LOW (0.04-0.08). Do NOT raise edge_darken (a dark outline on every',
-	'     face reads as a dirty grid — the look to avoid). streaks:true adds fur/wood/',
-	'     stone grain on top/back faces.',
-	'   - Glow parts (eyes cores, gems, lanterns, runes): name them *_core or *_glow —',
-	'     detail_cubes fills them bright with no shading/blur. Mark the texture emissive',
-	'     with set_texture_render_mode for real in-engine glow.',
+	'3. RESOLUTION. Characters: 2-4 texture pixels per unit (e.g. project UV 64 wide with',
+	'   a 128-256 px texture); a face needs at least 16x16 px for anime eyes. Props: 1-2.',
 	'',
-	'4. CRISP FEATURES — paint_faces, AFTER the bake (so blur does not soften them).',
-	'   Coords are RELATIVE to each face ([0,0] = its top-left). Eyes are the #1 thing',
-	'   that makes a creature read as alive: dark socket rect, bright iris, 1px hotspot.',
-	'   Also nose, mouth, claws, stripes, scars, armour trim, rune lines. Ops: rect,',
-	'   ellipse, polygon, line, gradient, dither (patterns), noise.',
+	'4. detail_cubes IS THE ENGINE. Each pixel is shaded from its 3D point: hue-shifted',
+	'   ramps (cool shadows, warm lights), ambient occlusion where parts meet, 1px bevels',
+	'   on edges, ground darkening, per-material detail. Give every region a rule:',
+	'     {match:"^hair", material:"hair", color:"$hair"}          strands + shine band',
+	'     {match:"skin|face|hand|neck", material:"skin", color:"$skin"}',
+	'     {match:"skirt", material:"cloth", color:"$skirt", pattern:[',
+	'        {type:"plaid", color:"$skirt.deep", size:4},',
+	'        {type:"lace", edges:"bottom", width:2, style:"zigzag", color:"#ffffff"}]}',
+	'     {match:"buckle|ring", material:"metal", color:"#c9ced6"}',
+	'     {match:"_glow|gem", material:"emissive", color:"#7ff3ff"}',
+	'   Materials: matte skin cloth leather metal gold wood stone hair fur plastic rubber',
+	'   glass crystal foliage bone scales emissive. Patterns: plaid, stripes, checker,',
+	'   dots, panels (+rivets), grille/vents, hazard, bricks, planks, scales, trim/lace',
+	'   borders, gradient, speckle — in world space, so they run across neighbouring cubes.',
+	'   finish: "painted" (default), "pixel" (dithered pixel art), "cel" (anime bands).',
+	'   Re-run detail_cubes after geometry changes: AO and bevels come from the geometry.',
 	'',
-	'5. INSPECT. get_texture shows the sheet; screenshot_views shows it on the model.',
-	'   Compare to the reference palette. Recolour with detail_cubes `colors` and repeat.',
+	'5. FACES. paint_face {style:"anime", eye_color, expression, blush} draws the eyes,',
+	'   brows, mouth and blush upright in the face\'s own grid. Tune eye_width/eye_height/',
+	'   eye_y in pixels if the reference differs; check it with inspect_model (face spot).',
+	'',
+	'6. CRISP EXTRAS — paint_faces AFTER the bake: logos, scars, runes, insignia, seams.',
+	'   Coordinates are relative to each face ([0,0] = its top-left).',
+	'',
+	'7. INSPECT the result up close (screenshot_views close-ups, get_texture for the',
+	'   sheet) and compare with the reference palette. Recolour and re-bake.',
 ].join('\n');
 
 const VFX_GUIDE = [
@@ -1861,9 +1937,17 @@ const REFERENCE_GUIDE = [
 	'NUMBER. Use the number, not your opinion.',
 	'',
 	'THE TOOLS:',
+	'- find_references {query, kind} — search the web (safe search on) and get ONE',
+	'  numbered contact sheet. ALWAYS do this for a known subject (named character,',
+	'  creature, franchise item, vehicle, building, real product), even when the user',
+	'  gave an image: you need the back, the sides and the small parts. Prefer official',
+	'  art, turnaround / reference sheets and clean full-body views; skip fan restyles,',
+	'  cosplay photos and crops. Load 2-4 with load:[N,M] or load_reference {result:N}.',
 	'- get_reference — returns the reference image(s) the user dropped in the MCP Copilot',
 	'  panel (or that you loaded). LOOK at it before and during the build.',
-	'- load_reference {path|data_url} — add a reference from disk / a data URL yourself.',
+	'- zoom_reference {rect} — enlarge a detail (face, buckle, hem) and COUNT what is there.',
+	'- make_palette {regions} — named colour ramps read from the image ("$hair" etc.).',
+	'- load_reference {result|url|path|data_url} — add a reference yourself.',
 	'- compare_reference {view?} — THE key tool. Renders your model from the chosen angle',
 	'  on a transparent background, extracts both silhouettes, and returns:',
 	'    match_percent (silhouette IoU 0-100), aspect_delta_pct (too wide/narrow),',
@@ -1877,8 +1961,11 @@ const REFERENCE_GUIDE = [
 	'',
 	'THE LOOP:',
 	'1. get_reference and describe it concretely in words: stance; head size & position;',
-	'   limbs/appendages (count + shape); key features; ~5 palette colours; what is',
-	'   BIGGEST. Turn that into a bone + part list before building.',
+	'   limbs/appendages (count + shape); key features; what is BIGGEST. zoom_reference',
+	'   into the face and every accessory. make_palette with regions for each material.',
+	'   Where the user\'s image and the web references disagree (outfit, pose), the',
+	'   USER\'S image wins; use the others for the angles it does not show.',
+	'   Turn all of that into a bone + part list before building.',
 	'2. Build the grey silhouette (no texture yet). Aim the camera to the reference angle',
 	'   (set_camera_angle / screenshot_views; models usually face -Z so "back" shows the',
 	'   FACE) — or pass `view` to compare_reference.',
@@ -1886,7 +1973,7 @@ const REFERENCE_GUIDE = [
 	'   it RED (add/enlarge parts there)? where BLUE (shrink/move)? Is aspect_delta_pct',
 	'   telling you too wide/narrow? Fix the SINGLE biggest delta.',
 	'4. compare_reference again. Repeat until match_percent >= 85 (90+ for a hero asset).',
-	'   Only THEN texture — match the palette with detail_cubes `colors` + paint_faces.',
+	'   Only THEN texture — detail_cubes with the palette keys, paint_face, paint_faces.',
 	'5. NEVER declare success on opinion when a compare score exists. If match_percent is',
 	'   72 and you "think it looks great", it does not — keep going. Stop when the number',
 	'   is high AND the side-by-side would convince the user, not just you.',
@@ -1901,12 +1988,14 @@ const DETAILING_GUIDE = [
 	'is impossible. That is a tooling problem, not a taste problem. The generators below',
 	'do the arithmetic; your job is the SHAPE and the LAYERS.',
 	'',
-	'1. CUBE BUDGET (audit_complexity enforces it):',
+	'1. CUBE BUDGET (audit_complexity enforces the minimum):',
 	'     simple prop / small item .......  30-60 cubes',
 	'     standard mob / NPC ............. 100-180 cubes',
-	'     hero model / boss / detailed ... 180-300+ cubes',
+	'     hero model / detailed character  180-350 cubes',
 	'   A humanoid built from under ~70 cubes is a DRAFT, not a model, and must not go to',
-	'   texturing. Cube count alone is not quality — but under budget is always a fail.',
+	'   texturing. OPTIMISED means every cube is visible and does a job: no cube buried',
+	'   inside another (check_model: hidden_cube), no two cubes where one would read the',
+	'   same, no detail smaller than a texture pixel. Spend the budget on the outside.',
 	'',
 	'2. THE 4-LAYER DOCTRINE. Build outward, one layer at a time.',
 	'   Layer 0 — CORE FRAME: the skeleton and joint volumes (create_rig), plus the dark',
@@ -1952,7 +2041,13 @@ const DETAILING_GUIDE = [
 	'   add_wing           a whole bat / dragon wing: arm, forearm, a fan of finger bones and',
 	'                      a CONTINUOUS membrane to the body, parented so it flaps as one.',
 	'                      Never hand-place rotated membrane slabs — they gap and z-fight.',
-	'   Use them for the repetitive mass and add_cubes for the shapes only you can judge.',
+	'   add_flare          skirts, capes, coat tails, faulds, lampshades, cone roofs —',
+	'                      panels tilted and turned outward into one round shell.',
+	'   add_hair           cap, bangs, side locks, back strands, tails with ribbons.',
+	'   add_cylinder /     round parts, gears that mesh, pipes with fittings — see',
+	'   add_gear/add_pipe  get_guide {topic:"mechanism"}.',
+	'   Use them for the repetitive mass and add_cubes (center/size, attach, mirror) for',
+	'   the shapes only you can judge.',
 	'',
 	'5. DEPTH DISCIPLINE (this is what makes layers read as layers):',
 	'   - Layer 2 stands 0.3-0.8 proud of Layer 1. Less and it looks like a texture; more',
@@ -1961,11 +2056,9 @@ const DETAILING_GUIDE = [
 	'     0.05-0.2 (generate_array depth_stagger does it for you). Two coplanar faces',
 	'     z-fight, which is the flickering "two squares inside each other" artefact.',
 	'   - When two cubes overlap, let one clearly PENETRATE the other by >=0.1.',
-	'   - check_model reports coplanar_overlap; fix every one. The generators also',
-	'     report `z_fight_pairs` on their own output when they could not avoid it —',
-	'     a row where each element overlaps two neighbours still lines up, and elements',
-	'     at the same height share top/bottom planes. Fix it with jitter, spacing or',
-	'     a small rotation_range, do not ship it.',
+	'   - Every building tool fixes the coplanar faces it creates (z_fight_fixed); any',
+	'     left over are reported as z_fight_pairs. check_model + inspect_model show the',
+	'     rest; fix_z_fighting resolves them. Do not ship a flicker.',
 	'',
 	'6. THE PIPELINE:',
 	'   1  read the reference, split the silhouette into the four layers',
@@ -1974,14 +2067,124 @@ const DETAILING_GUIDE = [
 	'   4  add_hollow_volume               (Layer 0 cavities + Layer 2 shells)',
 	'   5  generate_array                  (Layer 3 fringes, plates, scales)',
 	'   6  voxelize_matrix / extrude_chain (Layer 4 props, weapons, horns, micro-detail)',
-	'   7  audit_complexity + compare_reference + check_model  -> FIX, then repeat',
-	'   8  pack_uv -> create_texture -> detail_cubes -> paint_faces',
+	'   7  audit_complexity + compare_reference + check_model + inspect_model -> FIX',
+	'   8  pack_uv -> create_texture -> detail_cubes -> paint_face / paint_faces',
 	'   9  request_review — the user, not you, decides it is done',
 	'',
 	'7. THE GATE: audit_complexity returns too_primitive / acceptable / high_detail plus',
 	'   monolithic boxes, layering, micro-detail density and bare slabs. Verdict',
 	'   too_primitive means keep building; it is not a suggestion. Texturing a blockout',
 	'   wastes the whole texturing pass.',
+].join('\n');
+
+const CHARACTER_GUIDE = [
+	'CHARACTERS (anime, stylised, game NPCs) — the recipe that does not come out as boxes.',
+	'',
+	'0. REFERENCES. Named character? find_references {kind:"character"} and load a',
+	'   turnaround / reference sheet plus a full-body view. The user\'s image decides the',
+	'   outfit and pose; the sheets show the back of the hair and the sides.',
+	'   make_palette {regions:[hair, skin, eyes, each garment, accents]}.',
+	'',
+	'1. PROPORTIONS (heads tall): chibi 2-3, Minecraft-like 4, stylised anime 5-6.',
+	'   The head is the hero: make it 8-10 units wide so the face gets >=16 px at 2 px/unit.',
+	'   Shoulders ~1.5 head widths (narrower for slim characters), hips about the same,',
+	'   legs about half the height. measure_model {head_height_fraction} checks it.',
+	'',
+	'2. RIG FIRST. create_rig (or add_groups) with bones at the joints: hips > waist >',
+	'   chest > neck > head; shoulder > upper_arm > forearm > hand; thigh > shin > foot.',
+	'   Pose with bone rotations (arms in, hands clasped) — never by tilting cubes.',
+	'',
+	'3. BODY (Layer 1): chest, waist, hips as separate cubes; neck; arms and legs in',
+	'   three segments, tapering. Hands: palm + a thumb + a finger block (two finger',
+	'   blocks at 3+ px detail). Feet: foot + toe cap.',
+	'',
+	'4. HEAD AND HAIR: the head cube, then add_hair {style, bangs, length, tails, ribbon}.',
+	'   Bangs must stop above the eyes (bang_length ~0.3-0.4 when eyes sit mid-face).',
+	'   Twin tails / ponytails get their own bone chains so they can swing. Add an ahoge',
+	'   or side locks only if the reference has them.',
+	'',
+	'5. FACE: texture first, then paint_face {style:"anime", eye_color, expression, blush}.',
+	'   Check it with inspect_model — the face close-up is always included.',
+	'',
+	'6. CLOTHES ARE LAYERS (Layer 2), never recoloured skin:',
+	'   - tops/sleeves: separate cubes 0.15-0.3 proud of the body (or inflate copies);',
+	'     off-shoulder tops leave the shoulders as skin.',
+	'   - skirts: add_flare {center at the waist, elliptical radii, segments 14-20,',
+	'     pleat 0.15-0.3, rows 2 for a curved hem}; tuck the top ring 0.2 INTO the waist.',
+	'   - stockings/socks/gloves: separate cubes or inflate 0.1 over the limb, ending at',
+	'     a visible edge (a band cube) — not just a colour change.',
+	'   - straps, collars, belts, ribbons, buttons, buckles: add_cubes with attach so they',
+	'     sit ON the surface; mirror:true for pairs. Bows = 2 tilted loops + a knot.',
+	'',
+	'7. TEXTURE: detail_cubes with materials (skin, cloth, hair, leather, metal) + patterns',
+	'   (plaid, lace hems, trims) + palette keys. finish:"cel" gives an anime look.',
+	'',
+	'8. CHECK: check_model (0 issues), inspect_model (face, hands, joints, skirt hem),',
+	'   compare_reference >= 85, screenshot_views, then request_review.',
+].join('\n');
+
+const MECHANISM_GUIDE = [
+	'MECHANISMS (gears, engines, clockwork, vehicles, turrets) — machines that read as',
+	'machines and actually move.',
+	'',
+	'1. MOVING PARTS ARE BONES. Every part that moves gets its own bone with the pivot ON',
+	'   its axle or hinge. The static frame is separate. Plan the kinematic tree first:',
+	'   what drives what.',
+	'',
+	'2. ROUND THINGS ARE ROUND. add_cylinder for wheels, drums, pistons, axles, pillars,',
+	'   lenses (solid or tube with inner_radius). Never one box for a wheel.',
+	'',
+	'3. GEARS: add_gear {radius, thickness, spokes} for the first; every next gear with',
+	'   mesh_with:{gear:"<first>", angle} — the centre distance, a matching tooth count and',
+	'   the half-tooth phase are computed so the teeth interleave. Big gear + small pinion',
+	'   reads better than equal gears. inspect_model shows each gear contact up close.',
+	'',
+	'4. PIPES AND CABLES: add_pipe {points, radius} — round segments, fittings, flanges.',
+	'',
+	'5. PISTONS / SLIDERS: a cylinder (the bore) + a thinner cylinder rod on its own bone,',
+	'   animated with type:"slide" along its axis. Levers / doors / hatches: bone on the',
+	'   hinge, type:"swing".',
+	'',
+	'6. DETAIL THAT SAYS "MACHINE": panel lines + rivets (detail_cubes pattern panels),',
+	'   bolts in a ring (generate_array ring), hazard stripes on moving edges, vents,',
+	'   a darker frame vs brighter moving parts (steel frame, brass gears), emissive',
+	'   indicator lights (_glow), metal sheen + scratches from the metal/gold materials.',
+	'',
+	'7. ANIMATE: animate_mechanism {parts:[{bone:"gear_a", type:"spin", turns:1},',
+	'   {bone:"gear_b", driven_by:"gear_a"}, {bone:"piston", type:"slide", distance:2},',
+	'   {bone:"lamp", type:"pulse"}]} — ratios, directions and a seamless loop are',
+	'   worked out for you. preview_animation to watch it.',
+	'',
+	'8. FORMAT LIMITS: Java block models rotate one axis in 22.5 degree steps (use 8 or 16',
+	'   sides, no free gear phases). Bedrock / GeckoLib / Generic allow everything.',
+].join('\n');
+
+const INSPECTION_GUIDE = [
+	'INSPECTION — four full-body screenshots hide the problems that matter. Look closer.',
+	'',
+	'1. check_model lists every problem in world space: z-fighting / duplicates, floating',
+	'   parts, hidden cubes, stretched or missing UVs, left/right mistakes.',
+	'',
+	'2. inspect_model takes a CLOSE-UP of each problem spot, clips away whatever stands in',
+	'   front of it (x-ray) and outlines the cubes involved with their names and a caption',
+	'   saying what is wrong and how to fix it. Then it adds the detail spots that go wrong',
+	'   most often even when nothing is flagged: the face, each hand and foot, limb joints,',
+	'   gear contacts. screenshot_views appends up to 4 of these after the 4 sides.',
+	'',
+	'3. READ THE CLOSE-UPS:',
+	'   - striped / speckled flicker on a face ........ z-fighting -> fix_z_fighting',
+	'   - a part with a gap of background around it ... floating -> move it into contact',
+	'   - "hidden" label ............................... buried cube -> delete it',
+	'   - crease or gap at a joint ..................... overlap the parts around the pivot',
+	'   - eyes wrong size / bangs over the eyes ........ paint_face params / bang_length',
+	'   - hands as one blob ............................ add a thumb + finger block',
+	'   - gear teeth overlapping ....................... mesh_with angle / phase',
+	'',
+	'4. AIM IT YOURSELF: inspect_model {cubes:["skirt_3", "belt"]} or {at:[x,y,z], size:3,',
+	'   view:"left"} for anything you want to check against zoom_reference of the same spot.',
+	'',
+	'5. LOOP: fix -> inspect_model until problem_spots is 0 and the detail close-ups match',
+	'   the reference. Then request_review.',
 ].join('\n');
 
 const GUIDES = {
@@ -1994,6 +2197,9 @@ const GUIDES = {
 	orientation: ORIENTATION_GUIDE,
 	review: REVIEW_GUIDE,
 	reference: REFERENCE_GUIDE,
+	character: CHARACTER_GUIDE,
+	mechanism: MECHANISM_GUIDE,
+	inspection: INSPECTION_GUIDE,
 };
 
 // ---------------------------------------------------------------------------
@@ -3226,6 +3432,344 @@ async function captureViews(views, options) {
 const DEFAULT_VIEWS = ['front_right', 'front', 'left', 'back'];
 
 // ---------------------------------------------------------------------------
+// INSPECTION — close-ups of the places a model actually goes wrong. Four
+// full-body views hide the problems that matter: a 0.7-unit z-fight under the
+// hair, an eye floating 0.2 in front of the face, a gap at the shoulder. This
+// finds those spots (and the detail spots worth checking even when nothing is
+// flagged: face, hands, feet, joints, gear contacts), frames each one, clips
+// away whatever stands in front, and outlines the cubes involved.
+// ---------------------------------------------------------------------------
+
+function polyCentroid(poly) {
+	const c = [0, 0, 0];
+	poly.forEach((p) => { c[0] += p[0]; c[1] += p[1]; c[2] += p[2]; });
+	return c.map((v) => v / poly.length);
+}
+function polyExtent(poly) {
+	let m = 0;
+	for (let i = 0; i < poly.length; i++) for (let j = i + 1; j < poly.length; j++) {
+		m = Math.max(m, Math.hypot(poly[i][0] - poly[j][0], poly[i][1] - poly[j][1], poly[i][2] - poly[j][2]));
+	}
+	return m;
+}
+/** A view direction that looks at a surface with normal n from slightly above and to the side. */
+function obliqueDir(n, amount) {
+	const o = orientation();
+	let up = o.up_vec;
+	if (Math.abs(vecDot(n, up)) > 0.9) up = o.front_vec;
+	const k = vecDot(up, n);
+	const u = vecNorm([up[0] - n[0] * k, up[1] - n[1] * k, up[2] - n[2] * k]);
+	const r = vecNorm(vecCross(n, u));
+	const a = amount == null ? 0.35 : amount;
+	return vecNorm([n[0] + u[0] * a + r[0] * a * 0.7, n[1] + u[1] * a + r[1] * a * 0.7, n[2] + u[2] * a + r[2] * a * 0.7]);
+}
+
+/** Cube fully inside another cube: invisible, wasted, and a z-fight waiting to happen. */
+function findHiddenCubes(limit) {
+	const all = Cube.all.filter((c) => c.visibility !== false && c.export !== false);
+	const infos = all.map(cubeWorldInfo);
+	const out = [];
+	for (const A of infos) {
+		if (out.length >= (limit || 40)) break;
+		for (const B of infos) {
+			if (A === B || B.volume <= A.volume) continue;
+			if (!aabbOverlap(A, B, 0)) continue;
+			if (A.corners.every((p) => pointInInfo(B, p, -0.005))) { out.push({ a: A, b: B }); break; }
+		}
+	}
+	return out;
+}
+
+/** Everything worth a close-up, most important first. */
+function collectInspectionPoints(opts) {
+	opts = opts || {};
+	const o = orientation();
+	const pts = [];
+	const want = (k) => !opts.kinds || opts.kinds.includes(k);
+	// 1) z-fighting / duplicates
+	if (want('z_fighting')) {
+		findZFighting({ limit: 80 }).forEach((pr) => {
+			const fa = pr.a.faces.find((f) => f.dir === pr.face_a);
+			const fb = pr.b.faces.find((f) => f.dir === pr.face_b);
+			const small = pr.a.volume <= pr.b.volume ? fa : fb;
+			pts.push({
+				kind: pr.duplicate ? 'duplicate_cube' : 'z_fighting', priority: 1,
+				center: polyCentroid(small.poly), size: Math.max(1, polyExtent(small.poly)),
+				dir: obliqueDir(fa.normal, 0.3), cubes: [pr.a.cube, pr.b.cube],
+				label: pr.duplicate
+					? `duplicate: ${pr.a.cube.name} = ${pr.b.cube.name}`
+					: `z-fight: ${pr.a.cube.name} / ${pr.b.cube.name} (${pr.face_a} faces share a plane)`,
+				fix: pr.duplicate ? 'delete one of the two' : 'fix_z_fighting, or move/inflate the smaller one by >=0.05',
+			});
+		});
+	}
+	// 2) floating parts
+	if (want('floating')) {
+		const { center: mc } = sceneBounds();
+		findFloatingParts().forEach((f) => {
+			const b = f.world_bounds;
+			const c = [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, (b.min[2] + b.max[2]) / 2];
+			const gapDir = vecNorm([c[0] - mc[0], c[1] - mc[1], c[2] - mc[2]]);
+			let side = vecCross(gapDir, o.up_vec);
+			if (Math.hypot(...side) < 0.2) side = o.right_vec;
+			pts.push({
+				kind: 'floating_part', priority: 2, center: c, size: Math.max(1.5, ...b.size) + f.gap_to_main_body,
+				dir: vecNorm([side[0] + o.up_vec[0] * 0.3, side[1] + o.up_vec[1] * 0.3, side[2] + o.up_vec[2] * 0.3]),
+				cubes: f.cubes.map(findElement).filter(Boolean),
+				label: `floating: ${f.cubes.slice(0, 3).join(', ')}${f.cube_count > 3 ? ' +' + (f.cube_count - 3) : ''} — ${f.gap_to_main_body} units from the body`,
+				fix: 'move it until it overlaps what it hangs on by 0.1-0.5',
+			});
+		});
+	}
+	// 3) left/right mistakes
+	if (want('sides')) {
+		try {
+			(commands.check_sides().issues || []).forEach((is) => {
+				const names = [].concat(is.element || is.name || is.cube || is.group || [], is.elements || is.pair || []).filter((x) => typeof x === 'string');
+				const nodes = names.map(findElement).concat(names.map(findGroup)).filter(Boolean);
+				const cubes = [];
+				nodes.forEach((n) => { if (n instanceof Cube) cubes.push(n); else if (n.children) n.forEachChild && n.forEachChild((c) => { if (c instanceof Cube) cubes.push(c); }, Cube); });
+				if (!cubes.length) return;
+				const b = boundsOfCubes(cubes.map((c) => { const w = cubeWorldInfo(c); return { from: w.min, to: w.max }; }));
+				pts.push({
+					kind: 'side_mismatch', priority: 3, center: b.min.map((v, k) => (v + b.max[k]) / 2), size: Math.max(2, ...b.size),
+					dir: obliqueDir(o.front_vec, 0.4), cubes, label: `sides: ${is.issue || ''} ${names.slice(0, 2).join(' / ')}`.trim(),
+					fix: is.hint || is.fix || 'rename or move so *_right sits on the model\'s right',
+				});
+			});
+		} catch (e) { /* the side check is best-effort here */ }
+	}
+	// 4) hidden cubes
+	if (want('hidden')) {
+		findHiddenCubes(30).forEach(({ a, b }) => {
+			pts.push({
+				kind: 'hidden_cube', priority: 4, center: a.min.map((v, k) => (v + a.max[k]) / 2), size: Math.max(1, ...a.size),
+				dir: obliqueDir(o.front_vec, 0.5), cubes: [a.cube, b.cube], xray: true,
+				label: `hidden: ${a.cube.name} is completely inside ${b.cube.name}`,
+				fix: 'delete it (it is never visible) or make it stick out',
+			});
+		});
+	}
+	// 5) detail spots
+	if (want('details')) {
+		const byName = (re) => Cube.all.filter((c) => re.test(c.name));
+		const headCube = Cube.all.find((c) => /^head$/i.test(c.name)) || byName(/head|skull/i).sort((a, b) => cubeWorldInfo(b).volume - cubeWorldInfo(a).volume)[0];
+		if (headCube) {
+			const w = cubeWorldInfo(headCube);
+			const front = w.faces.map((f) => ({ f, d: vecDot(f.normal, o.front_vec) })).sort((a, b) => b.d - a.d)[0].f;
+			pts.push({
+				kind: 'face', priority: 6, center: polyCentroid(front.poly), size: Math.max(2, polyExtent(front.poly) * 0.5),
+				dir: obliqueDir(front.normal, 0.12), cubes: [headCube], outline: false,
+				label: `face: ${headCube.name} — eyes, brows, mouth, hairline`, fix: 'paint_face / adjust bangs if anything reads wrong',
+			});
+		}
+		[['hand', /hand|fist|palm|glove/i], ['foot', /foot|feet|boot|shoe|paw/i]].forEach(([kind, re]) => {
+			['right', 'left'].forEach((side) => {
+				const c = byName(re).filter((x) => sideFromName(x.name) === side || (sideFromName(x.name) == null && sideOfCoord(sideCoordOf(x)) === side))[0];
+				if (!c) return;
+				const w = cubeWorldInfo(c);
+				const sideVec = side === 'right' ? o.right_vec : o.left_vec;
+				pts.push({
+					kind, priority: 7, center: w.min.map((v, k) => (v + w.max[k]) / 2), size: Math.max(2, ...w.size) * 1.4,
+					dir: vecNorm([o.front_vec[0] + sideVec[0] * 0.6 + o.up_vec[0] * 0.3, o.front_vec[1] + sideVec[1] * 0.6 + o.up_vec[1] * 0.3, o.front_vec[2] + sideVec[2] * 0.6 + o.up_vec[2] * 0.3]),
+					cubes: [c], label: `${kind} (${side}): ${c.name}`, fix: '',
+				});
+			});
+		});
+		// Elbows and knees first: they bend the most and are not hidden under clothes like the pelvis.
+		const jointRank = (n) => (/lower|fore|shin|calf|elbow|knee/i.test(n) ? 0 : /upper|thigh|shoulder/i.test(n) ? 1 : /neck/i.test(n) ? 2 : 3);
+		const directCubes = (g) => (g && g.children ? g.children.filter((c) => c instanceof Cube) : []);
+		Group.all
+			.filter((g) => g.parent instanceof Group && /shoulder|upper_?arm|arm|elbow|leg|thigh|knee|shin|neck/i.test(g.name) && !/^(hips?|pelvis|root)$/i.test(g.name))
+			.sort((a, b) => jointRank(a.name) - jointRank(b.name))
+			.slice(0, 6).forEach((g) => {
+			const X = nodeWorld(g.parent);
+			const center = xformPoint(X, g.origin);
+			// Only the parts that meet at this pivot — not the whole subtree below it.
+			const distTo = (c) => {
+				const w = cubeWorldInfo(c);
+				return Math.hypot(...[0, 1, 2].map((k) => Math.max(0, w.min[k] - center[k], center[k] - w.max[k])));
+			};
+			const kids = directCubes(g).concat(directCubes(g.parent)).filter((c) => distTo(c) < 1.2).sort((a, b) => distTo(a) - distTo(b));
+			if (!kids.length) return;
+			pts.push({
+				kind: 'joint', priority: 8, center, size: 3.5, dir: obliqueDir(o.front_vec, 0.45), cubes: kids.slice(0, 4),
+				label: `joint: ${g.name} — no gap or crease when it bends?`, fix: 'overlap the parts 0.25-0.5 around the pivot',
+			});
+		});
+		try {
+			const reg = Project.mcp_gears || {};
+			const names = Object.keys(reg);
+			for (let i = 0; i < names.length; i++) for (let j = i + 1; j < names.length; j++) {
+				const A = reg[names[i]], B = reg[names[j]];
+				const d = Math.hypot(A.center[0] - B.center[0], A.center[1] - B.center[1], A.center[2] - B.center[2]);
+				if (A.axis !== B.axis || Math.abs(d - A.pitch_radius - B.pitch_radius) > 1) continue;
+				const t = A.pitch_radius / d;
+				const c = A.center.map((v, k) => v + (B.center[k] - v) * t);
+				const ax = [0, 0, 0]; ax[AXIS_INDEX[A.axis]] = 1;
+				pts.push({ kind: 'gear_mesh', priority: 7, center: c, size: 4, dir: obliqueDir(vecDot(ax, o.front_vec) < 0 ? vecNeg(ax) : ax, 0.15), cubes: [], label: `gear mesh: ${names[i]} x ${names[j]} — teeth must interleave, not overlap`, fix: 'change phase or mesh_with angle' });
+			}
+		} catch (e) {}
+	}
+	// Merge spots that would make the same picture.
+	pts.sort((a, b) => a.priority - b.priority);
+	const merged = [];
+	for (const p of pts) {
+		const near = merged.find((m) => m.priority <= 4 && p.priority <= 4 && Math.hypot(m.center[0] - p.center[0], m.center[1] - p.center[1], m.center[2] - p.center[2]) < Math.max(1.2, Math.min(m.size, p.size) * 0.6));
+		if (near) {
+			near.labels.push(p.label);
+			p.cubes.forEach((c) => { if (!near.cubes.includes(c)) near.cubes.push(c); });
+			near.count++;
+			continue;
+		}
+		merged.push(Object.assign(p, { labels: [p.label], count: 1 }));
+	}
+	return merged;
+}
+
+/** Screen-space rect of a cube's world box under the current camera, in 0..1 image coords. */
+function projectedRect(cube, camera, offset) {
+	const w = cubeWorldInfo(cube);
+	let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, front = false;
+	for (const c of w.corners) {
+		const v = new THREE.Vector3(c[0] + offset[0], c[1] + offset[1], c[2] + offset[2]).project(camera);
+		if (v.z > 1 || v.z < -1) continue; // behind the camera, or cut away by the x-ray near plane
+		front = true;
+		const sx = (v.x + 1) / 2, sy = (1 - v.y) / 2;
+		x0 = Math.min(x0, sx); y0 = Math.min(y0, sy); x1 = Math.max(x1, sx); y1 = Math.max(y1, sy);
+	}
+	if (!front) return null;
+	// Off-frame cubes get no box (a label stuck in the corner points at nothing).
+	const cx0 = Math.max(0, x0), cy0 = Math.max(0, y0), cx1 = Math.min(1, x1), cy1 = Math.min(1, y1);
+	if (cx1 - cx0 < 0.01 || cy1 - cy0 < 0.01) return null;
+	return [cx0, cy0, cx1, cy1];
+}
+
+/** Model-space -> scene-space offset (block formats shift the model in the scene). */
+function sceneOffset() {
+	try {
+		const c = Cube.all.find((x) => x.mesh);
+		if (!c) return [0, 0, 0];
+		const box = new THREE.Box3().setFromObject(c.mesh);
+		const w = cubeWorldInfo(c);
+		const mc = box.getCenter(new THREE.Vector3());
+		return [mc.x - (w.min[0] + w.max[0]) / 2, mc.y - (w.min[1] + w.max[1]) / 2, mc.z - (w.min[2] + w.max[2]) / 2];
+	} catch (e) { return [0, 0, 0]; }
+}
+
+async function drawInspectionOverlay(dataUrl, rects, title, lines) {
+	try {
+		const img = await loadImageElement(dataUrl);
+		const W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
+		const cv = document.createElement('canvas');
+		cv.width = W; cv.height = H;
+		const x = cv.getContext('2d');
+		x.drawImage(img, 0, 0);
+		const s = Math.max(1, W / 500);
+		const colors = ['#ff4d4d', '#33d6ff', '#ffd23f', '#7dff6a', '#ff7de9', '#ffffff'];
+		rects.forEach((r, i) => {
+			if (!r.rect) return;
+			const [a, b, c, d] = r.rect;
+			const pad = 4 * s;
+			x.strokeStyle = colors[i % colors.length];
+			x.lineWidth = 2 * s;
+			x.setLineDash(i ? [6 * s, 4 * s] : []);
+			x.strokeRect(a * W - pad, b * H - pad, (c - a) * W + 2 * pad, (d - b) * H + 2 * pad);
+			x.setLineDash([]);
+			x.font = `bold ${Math.round(11 * s)}px monospace`;
+			const label = String(r.name).slice(0, 40);
+			const tw = x.measureText(label).width;
+			const lx = Math.max(2, Math.min(W - tw - 6 * s, a * W - pad)), ly = Math.max(14 * s, b * H - pad - 3 * s);
+			x.fillStyle = 'rgba(0,0,0,0.65)';
+			x.fillRect(lx - 2 * s, ly - 12 * s, tw + 4 * s, 15 * s);
+			x.fillStyle = colors[i % colors.length];
+			x.fillText(label, lx, ly);
+		});
+		// Caption box with what to look for.
+		const text = [title].concat(lines || []).filter(Boolean).map((t) => String(t).slice(0, Math.floor(W / (6.6 * s))));
+		x.font = `${Math.round(10.5 * s)}px monospace`;
+		const lh = 14 * s;
+		const boxH = text.length * lh + 6 * s;
+		x.fillStyle = 'rgba(10,12,16,0.78)';
+		x.fillRect(0, H - boxH, W, boxH);
+		text.forEach((t, i) => {
+			x.fillStyle = i === 0 ? '#ffd23f' : '#d9e1ee';
+			x.font = `${i === 0 ? 'bold ' : ''}${Math.round(10.5 * s)}px monospace`;
+			x.fillText(t, 5 * s, H - boxH + (i + 1) * lh);
+		});
+		return cv.toDataURL('image/png');
+	} catch (e) { return dataUrl; }
+}
+
+/** Render close-ups of the given inspection points. Restores the camera afterwards. */
+async function captureInspections(points, opts) {
+	opts = opts || {};
+	const preview = Preview.selected;
+	const cam = preview.camera;
+	const saved = {
+		pos: cam.position.clone(), target: preview.controls ? preview.controls.target.clone() : null,
+		near: cam.near, zoom: cam.zoom,
+	};
+	const off = sceneOffset();
+	// No auto-crop: the outlines are projected onto the full frame.
+	const shotOpts = { crop: false };
+	if (opts.width) shotOpts.width = opts.width;
+	if (opts.height) shotOpts.height = opts.height;
+	const hidden = [];
+	const shots = [];
+	try {
+		for (let i = 0; i < points.length; i++) {
+			const pt = points[i];
+			const c = [pt.center[0] + off[0], pt.center[1] + off[1], pt.center[2] + off[2]];
+			const size = Math.max(1, pt.size) * (opts.zoom ? 1 / Number(opts.zoom) : 1);
+			const dist = Math.max(4, size * 3.1);
+			const d = vecNorm(pt.dir);
+			cam.position.set(c[0] + d[0] * dist, c[1] + d[1] * dist, c[2] + d[2] * dist);
+			if (preview.controls) preview.controls.target.set(c[0], c[1], c[2]);
+			cam.lookAt(c[0], c[1], c[2]);
+			// X-ray: clip whatever stands between the camera and the spot.
+			const xray = opts.xray !== false;
+			if (cam.isOrthographicCamera) cam.zoom = Math.max(0.05, (cam.top - cam.bottom) / (size * 2.6));
+			else if (xray) cam.near = Math.max(0.05, dist - size * (pt.xray ? 0.9 : 1.6));
+			cam.updateProjectionMatrix();
+			if (opts.isolate) {
+				const box = { min: pt.center.map((v) => v - size * 1.5), max: pt.center.map((v) => v + size * 1.5) };
+				Cube.all.forEach((cb) => {
+					if (!cb.mesh || !cb.mesh.visible || pt.cubes.includes(cb)) return;
+					if (!aabbOverlap(cubeWorldInfo(cb), box, 0)) { cb.mesh.visible = false; hidden.push(cb.mesh); }
+				});
+			}
+			preview.render();
+			let dataUrl = await new Promise((res) => Screencam.screenshotPreview(preview, shotOpts, (dd) => res(dd)));
+			cam.updateMatrixWorld();
+			const rects = pt.outline === false ? [] : pt.cubes.slice(0, 6).map((cb) => ({ name: cb.name, rect: projectedRect(cb, cam, off) }));
+			hidden.splice(0).forEach((m) => { m.visible = true; });
+			const title = `#${i + 1} ${pt.kind.toUpperCase()}${pt.count > 1 ? ` (x${pt.count})` : ''}`;
+			const lines = pt.labels.slice(0, 3).concat(pt.fix ? ['fix: ' + pt.fix] : []);
+			dataUrl = await drawInspectionOverlay(dataUrl, rects, title, lines);
+			const info = describeView(`inspect #${i + 1}`, d);
+			if (opts.annotate !== false) dataUrl = await annotateShot(dataUrl, info, pt.kind);
+			shots.push({
+				view: `inspect #${i + 1} ${pt.kind}`, kind: pt.kind, looking_at: info.looking_at,
+				note: pt.labels.join(' | ') + (pt.fix ? ` — fix: ${pt.fix}` : ''),
+				cubes: pt.cubes.map((cb) => cb.name).slice(0, 8),
+				center: pt.center.map(R3),
+				data_url: dataUrl, base64: dataUrl.replace(/^data:image\/png;base64,/, ''),
+			});
+		}
+	} finally {
+		hidden.forEach((m) => { m.visible = true; });
+		cam.position.copy(saved.pos);
+		if (saved.target && preview.controls) preview.controls.target.copy(saved.target);
+		cam.near = saved.near; cam.zoom = saved.zoom;
+		cam.updateProjectionMatrix();
+		preview.render();
+	}
+	return shots;
+}
+
+
+// ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
 
@@ -3410,16 +3954,18 @@ function normalizeFaceName(name) {
 }
 
 // ---- small rotation maths -------------------------------------------------
-// Blockbench (three.js) composes Euler angles in XYZ order: R = Rx·Ry·Rz.
-// extrude_chain needs this to place un-parented segments along a curve, and to
-// report where the tip of a bone chain actually ends up.
+// Blockbench sets every cube and bone mesh to three.js Euler order 'ZYX', so a
+// rotation [x,y,z] is the matrix R = Rz·Ry·Rx: X is applied first, then Y, then
+// Z. (Verified live against Cube.getGlobalVertexPositions in Blockbench 5.2.)
+// extrude_chain needs this to place un-parented segments along a curve, the
+// world-space checks need it to see where a rotated cube really is.
 function eulerToMat(deg) {
 	const rx = (deg[0] || 0) * Math.PI / 180, ry = (deg[1] || 0) * Math.PI / 180, rz = (deg[2] || 0) * Math.PI / 180;
-	const a = Math.cos(rx), b = Math.sin(rx), c = Math.cos(ry), d = Math.sin(ry), e = Math.cos(rz), f = Math.sin(rz);
+	const cx = Math.cos(rx), sx = Math.sin(rx), cy = Math.cos(ry), sy = Math.sin(ry), cz = Math.cos(rz), sz = Math.sin(rz);
 	return [
-		[c * e, -c * f, d],
-		[a * f + b * e * d, a * e - b * f * d, -b * c],
-		[b * f - a * e * d, b * e + a * f * d, a * c],
+		[cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+		[sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+		[-sy, cy * sx, cy * cx],
 	];
 }
 
@@ -3439,19 +3985,324 @@ function matApply(m, v) {
 	];
 }
 
+/** Inverse of eulerToMat for Blockbench's ZYX order: R = Rz·Ry·Rx -> [x,y,z] degrees. */
 function matToEuler(m) {
 	const clamp = (v) => (v < -1 ? -1 : v > 1 ? 1 : v);
-	const y = Math.asin(clamp(m[0][2]));
+	const y = Math.asin(clamp(-m[2][0]));
 	let x, z;
-	if (Math.abs(m[0][2]) < 0.99999) {
-		x = Math.atan2(-m[1][2], m[2][2]);
-		z = Math.atan2(-m[0][1], m[0][0]);
+	if (Math.abs(m[2][0]) < 0.99999) {
+		x = Math.atan2(m[2][1], m[2][2]);
+		z = Math.atan2(m[1][0], m[0][0]);
 	} else {
-		x = Math.atan2(m[2][1], m[1][1]);
+		x = Math.atan2(-m[1][2], m[1][1]);
 		z = 0;
 	}
 	const deg = (r) => +(r * 180 / Math.PI).toFixed(4);
 	return [deg(x), deg(y), deg(z)];
+}
+
+function matTranspose(m) {
+	return [[m[0][0], m[1][0], m[2][0]], [m[0][1], m[1][1], m[2][1]], [m[0][2], m[1][2], m[2][2]]];
+}
+
+// ---- world-space geometry ---------------------------------------------------
+// Cube coordinates are stored in their bone's rest frame; what the renderer
+// shows is that box carried through the cube's own rotation and then every
+// ancestor bone's rotation, each about its own origin. Every check that asks
+// "do these two faces overlap ON SCREEN?" has to work in that world space —
+// comparing stored coordinates misses rotated cubes, inflate, and bones.
+
+const IDENTITY3 = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+
+/** World transform {R, t} (world = R·p + t) of a cube or group, in the rest pose. */
+function nodeWorld(node) {
+	let R = IDENTITY3, t = [0, 0, 0];
+	for (let n = node; n && typeof n === 'object'; n = n.parent) {
+		const rot = n.rotation || [0, 0, 0];
+		const o = n.origin || [0, 0, 0];
+		if (rot[0] || rot[1] || rot[2]) {
+			const L = eulerToMat(rot);
+			// (L∘A)(p) = L·(R·p + t - o) + o
+			const tt = matApply(L, [t[0] - o[0], t[1] - o[1], t[2] - o[2]]);
+			R = matMul(L, R);
+			t = [tt[0] + o[0], tt[1] + o[1], tt[2] + o[2]];
+		}
+		if (!n.parent || n.parent === 'root') break;
+	}
+	return { R, t };
+}
+
+function xformPoint(X, p) {
+	const q = matApply(X.R, p);
+	return [q[0] + X.t[0], q[1] + X.t[1], q[2] + X.t[2]];
+}
+
+/** The box a cube actually renders: stored from/to grown by its inflate. */
+function cubeLocalBox(cube) {
+	const inf = Number(cube.inflate) || 0;
+	const f = cube.from, t = cube.to;
+	return {
+		min: [Math.min(f[0], t[0]) - inf, Math.min(f[1], t[1]) - inf, Math.min(f[2], t[2]) - inf],
+		max: [Math.max(f[0], t[0]) + inf, Math.max(f[1], t[1]) + inf, Math.max(f[2], t[2]) + inf],
+	};
+}
+
+// Local corner layout and outward normal of each face of an axis-aligned box.
+const FACE_GEOM = {
+	east:  { axis: 0, side: 1, n: [1, 0, 0] },
+	west:  { axis: 0, side: 0, n: [-1, 0, 0] },
+	up:    { axis: 1, side: 1, n: [0, 1, 0] },
+	down:  { axis: 1, side: 0, n: [0, -1, 0] },
+	south: { axis: 2, side: 1, n: [0, 0, 1] },
+	north: { axis: 2, side: 0, n: [0, 0, -1] },
+};
+
+/**
+ * Everything the world-space checks need about one cube: its transform, the
+ * 8 world corners, a world AABB and each face as a world polygon + normal.
+ */
+function cubeWorldInfo(cube) {
+	const X = nodeWorld(cube);
+	const box = cubeLocalBox(cube);
+	const corners = [];
+	for (let i = 0; i < 8; i++) {
+		corners.push(xformPoint(X, [
+			i & 1 ? box.max[0] : box.min[0],
+			i & 2 ? box.max[1] : box.min[1],
+			i & 4 ? box.max[2] : box.min[2],
+		]));
+	}
+	const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+	corners.forEach((c) => { for (let k = 0; k < 3; k++) { min[k] = Math.min(min[k], c[k]); max[k] = Math.max(max[k], c[k]); } });
+	const faces = [];
+	for (const dir in FACE_GEOM) {
+		const g = FACE_GEOM[dir];
+		if (cube.faces && cube.faces[dir] && cube.faces[dir].enabled === false) continue;
+		const a = (g.axis + 1) % 3, b = (g.axis + 2) % 3;
+		const fixed = g.side ? box.max[g.axis] : box.min[g.axis];
+		const quad = [[0, 0], [1, 0], [1, 1], [0, 1]].map(([i, j]) => {
+			const p = [0, 0, 0];
+			p[g.axis] = fixed;
+			p[a] = i ? box.max[a] : box.min[a];
+			p[b] = j ? box.max[b] : box.min[b];
+			return xformPoint(X, p);
+		});
+		faces.push({ dir, normal: matApply(X.R, g.n), poly: quad });
+	}
+	const size = [box.max[0] - box.min[0], box.max[1] - box.min[1], box.max[2] - box.min[2]];
+	return { cube, X, box, corners, min, max, faces, volume: size[0] * size[1] * size[2], size };
+}
+
+/** Area of the overlap of two convex polygons lying in the same plane. */
+function coplanarOverlapArea(polyA, polyB, normal) {
+	// 2D basis in the plane
+	const n = vecNorm(normal);
+	const ref = Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+	const u = vecNorm(vecCross(n, ref));
+	const v = vecCross(n, u);
+	const to2 = (p) => [vecDot(p, u), vecDot(p, v)];
+	const ccw = (poly) => {
+		let s = 0;
+		for (let i = 0; i < poly.length; i++) {
+			const p = poly[i], q = poly[(i + 1) % poly.length];
+			s += p[0] * q[1] - q[0] * p[1];
+		}
+		return s < 0 ? poly.slice().reverse() : poly;
+	};
+	let subject = ccw(polyA.map(to2));
+	const clip = ccw(polyB.map(to2));
+	for (let i = 0; i < clip.length && subject.length; i++) {
+		const c1 = clip[i], c2 = clip[(i + 1) % clip.length];
+		const inside = (p) => (c2[0] - c1[0]) * (p[1] - c1[1]) - (c2[1] - c1[1]) * (p[0] - c1[0]) >= -1e-9;
+		const cut = (p, q) => {
+			const A1 = c2[1] - c1[1], B1 = c1[0] - c2[0], C1 = A1 * c1[0] + B1 * c1[1];
+			const A2 = q[1] - p[1], B2 = p[0] - q[0], C2 = A2 * p[0] + B2 * p[1];
+			const det = A1 * B2 - A2 * B1;
+			if (Math.abs(det) < 1e-12) return p;
+			return [(B2 * C1 - B1 * C2) / det, (A1 * C2 - A2 * C1) / det];
+		};
+		const input = subject;
+		subject = [];
+		for (let k = 0; k < input.length; k++) {
+			const cur = input[k], prev = input[(k + input.length - 1) % input.length];
+			if (inside(cur)) {
+				if (!inside(prev)) subject.push(cut(prev, cur));
+				subject.push(cur);
+			} else if (inside(prev)) {
+				subject.push(cut(prev, cur));
+			}
+		}
+	}
+	let area = 0;
+	for (let i = 0; i < subject.length; i++) {
+		const p = subject[i], q = subject[(i + 1) % subject.length];
+		area += p[0] * q[1] - q[0] * p[1];
+	}
+	return Math.abs(area) / 2;
+}
+
+function aabbOverlap(a, b, pad) {
+	const e = pad || 0;
+	return a.min[0] <= b.max[0] + e && b.min[0] <= a.max[0] + e &&
+		a.min[1] <= b.max[1] + e && b.min[1] <= a.max[1] + e &&
+		a.min[2] <= b.max[2] + e && b.min[2] <= a.max[2] + e;
+}
+
+/**
+ * Every pair of faces that point the same way, lie on the same plane (within
+ * `eps`) and overlap by real area — the pairs that flicker. Works in WORLD space,
+ * so rotated cubes, inflate and posed bones are all accounted for. `focus`
+ * limits the search to pairs involving those cubes (a generator's own output).
+ */
+function findZFighting(opts) {
+	opts = opts || {};
+	const eps = opts.eps != null ? opts.eps : 0.02;
+	const minArea = opts.min_area != null ? opts.min_area : 0.004;
+	const limit = opts.limit || 400;
+	const all = (opts.cubes || (typeof Cube !== 'undefined' && Cube.all ? Cube.all : []))
+		.filter((c) => c && c.visibility !== false && c.export !== false);
+	const infos = all.map(cubeWorldInfo);
+	const focusSet = opts.focus ? new Set(opts.focus.map((c) => c.uuid)) : null;
+	const pairs = [];
+	for (let i = 0; i < infos.length && pairs.length < limit; i++) {
+		const A = infos[i];
+		const aFocus = focusSet ? focusSet.has(A.cube.uuid) : true;
+		for (let j = i + 1; j < infos.length && pairs.length < limit; j++) {
+			const B = infos[j];
+			if (focusSet && !aFocus && !focusSet.has(B.cube.uuid)) continue;
+			if (!aabbOverlap(A, B, eps)) continue;
+			let best = null;
+			for (const fa of A.faces) {
+				for (const fb of B.faces) {
+					if (vecDot(fa.normal, fb.normal) < 0.9995) continue;
+					const d = vecDot(fa.normal, [fa.poly[0][0] - fb.poly[0][0], fa.poly[0][1] - fb.poly[0][1], fa.poly[0][2] - fb.poly[0][2]]);
+					if (Math.abs(d) > eps) continue;
+					const area = coplanarOverlapArea(fa.poly, fb.poly, fa.normal);
+					if (area < minArea) continue;
+					if (!best || area > best.area) best = { fa: fa.dir, fb: fb.dir, area, gap: Math.abs(d) };
+				}
+			}
+			if (best) {
+				const dup = A.box.min.every((v, k) => Math.abs(v - B.box.min[k]) < 1e-3) &&
+					A.box.max.every((v, k) => Math.abs(v - B.box.max[k]) < 1e-3) &&
+					A.X.R.every((row, r) => row.every((v, c) => Math.abs(v - B.X.R[r][c]) < 1e-6));
+				pairs.push({ a: A, b: B, face_a: best.fa, face_b: best.fb, area: best.area, gap: best.gap, duplicate: dup });
+			}
+		}
+	}
+	return pairs;
+}
+
+/**
+ * Resolve z-fighting by growing the smaller (decorative) cube of each pair a
+ * hair outward with `inflate`. Inflate moves every face of that cube by the same
+ * amount and leaves box UVs untouched, so the texture layout survives. Rounds
+ * repeat until clean, so a row of overlapping elements ends up alternating
+ * instead of two neighbours being bumped into the same plane again.
+ */
+function fixZFighting(opts) {
+	opts = opts || {};
+	const step = opts.step != null ? Math.max(0.01, Number(opts.step)) : 0.05;
+	const rounds = opts.rounds || 6;
+	const bumps = new Map();
+	const changed = new Map();
+	const pairTarget = new Map();
+	let remaining = [];
+	let duplicates = [];
+	for (let r = 0; r < rounds; r++) {
+		const pairs = findZFighting({ focus: opts.focus, eps: opts.eps, limit: 2000 });
+		duplicates = pairs.filter((p) => p.duplicate).map((p) => [p.a.cube.name, p.b.cube.name]);
+		remaining = pairs;
+		if (!pairs.length) break;
+		const bumpedThisRound = new Set();
+		for (const pr of pairs) {
+			const ca = pr.a.cube, cb = pr.b.cube;
+			if (bumpedThisRound.has(ca.uuid) || bumpedThisRound.has(cb.uuid)) continue;
+			const na = bumps.get(ca.uuid) || 0, nb = bumps.get(cb.uuid) || 0;
+			let target;
+			if (opts.focus) {
+				const fs = new Set(opts.focus.map((c) => c.uuid));
+				if (fs.has(ca.uuid) && !fs.has(cb.uuid)) target = ca;
+				else if (fs.has(cb.uuid) && !fs.has(ca.uuid)) target = cb;
+			}
+			// A pair that comes back keeps pushing the SAME cube: alternating would
+			// inflate both equally and put their faces on one plane again.
+			const key = ca.uuid < cb.uuid ? ca.uuid + cb.uuid : cb.uuid + ca.uuid;
+			if (!target && pairTarget.has(key)) target = pairTarget.get(key) === ca.uuid ? ca : cb;
+			if (!target) {
+				if (na !== nb) target = na < nb ? ca : cb;
+				else target = pr.a.volume <= pr.b.volume ? ca : cb;
+			}
+			pairTarget.set(key, target.uuid);
+			target.inflate = R3((Number(target.inflate) || 0) + step);
+			bumps.set(target.uuid, (bumps.get(target.uuid) || 0) + 1);
+			bumpedThisRound.add(target.uuid);
+			changed.set(target.uuid, target);
+		}
+		remaining = [];
+	}
+	if (rounds > 0) remaining = findZFighting({ focus: opts.focus, eps: opts.eps, limit: 200 });
+	return {
+		fixed_cubes: Array.from(changed.values()).map((c) => ({ name: c.name, inflate: c.inflate })),
+		remaining: remaining.length,
+		remaining_examples: remaining.slice(0, 6).map((p) => ({ cubes: [p.a.cube.name, p.b.cube.name], faces: [p.face_a, p.face_b] })),
+		duplicates: duplicates.slice(0, 10),
+	};
+}
+
+/**
+ * Islands of geometry that touch nothing else — the "floating eyebrow" /
+ * "belt hovering off the waist" failure. Cubes are connected when their world
+ * boxes touch or overlap (within `pad`). Everything but the largest island is
+ * reported, with how far it floats from the main body.
+ */
+function findFloatingParts(opts) {
+	opts = opts || {};
+	const pad = opts.pad != null ? opts.pad : 0.05;
+	const all = (typeof Cube !== 'undefined' && Cube.all ? Cube.all : []).filter((c) => c.visibility !== false && c.export !== false);
+	if (all.length < 2) return [];
+	const infos = all.map(cubeWorldInfo);
+	const parentOf = infos.map((_, i) => i);
+	const find = (i) => { while (parentOf[i] !== i) { parentOf[i] = parentOf[parentOf[i]]; i = parentOf[i]; } return i; };
+	for (let i = 0; i < infos.length; i++) {
+		for (let j = i + 1; j < infos.length; j++) {
+			if (aabbOverlap(infos[i], infos[j], pad)) {
+				const a = find(i), b = find(j);
+				if (a !== b) parentOf[a] = b;
+			}
+		}
+	}
+	const groups = new Map();
+	infos.forEach((inf, i) => {
+		const r = find(i);
+		if (!groups.has(r)) groups.set(r, []);
+		groups.get(r).push(inf);
+	});
+	const islands = Array.from(groups.values()).map((list) => ({
+		list, volume: list.reduce((s, x) => s + Math.max(x.volume, 0.001), 0),
+	})).sort((a, b) => b.volume - a.volume);
+	const main = islands[0];
+	const gapTo = (A) => {
+		let best = Infinity;
+		for (const x of A.list) for (const y of main.list) {
+			let d2 = 0;
+			for (let k = 0; k < 3; k++) {
+				const g = Math.max(0, x.min[k] - y.max[k], y.min[k] - x.max[k]);
+				d2 += g * g;
+			}
+			best = Math.min(best, Math.sqrt(d2));
+		}
+		return best;
+	};
+	return islands.slice(1).map((isl) => {
+		const b = boundsOfCubes(isl.list.map((x) => ({ from: x.min, to: x.max })));
+		return {
+			cubes: isl.list.slice(0, 8).map((x) => x.cube.name),
+			cube_count: isl.list.length,
+			world_bounds: b,
+			gap_to_main_body: R3(gapTo(isl)),
+		};
+	});
 }
 
 // ---- matrix voxelization --------------------------------------------------
@@ -3464,70 +4315,36 @@ const VOXEL_PLANES = {
 };
 
 /**
- * Do any of these freshly generated cubes land a face on the same plane as
- * another cube's, overlapping in area? Those pairs flicker (z-fighting), and a
- * generator that quietly produced them would be worse than no generator. Same
- * rule as check_model, run over just this batch plus what it was built onto,
- * so the result can warn about itself.
+ * Fold a z-fighting report into a generator's result. By default the generator
+ * cleans up after itself: every generated cube whose face lands on the same
+ * plane as another face (overlapping in area) is grown 0.05 outward with
+ * inflate, so it can no longer flicker. Pass fix_z_fighting:false to get the
+ * report without the fix.
  */
-/**
- * Cube coordinates are stored before their bones rotate them, so two cubes can
- * only be compared face-to-face when the same rotated bones carry them. This key
- * names that chain; cubes under different chains (a wing's fingers, a curled
- * tail) overlap in stored coordinates without ever touching on screen.
- */
-function rotatedBoneKey(cube) {
-	const ids = [];
-	for (let g = cube.parent; g && typeof g === 'object' && g.children; g = g.parent) {
-		if (g.rotation && g.rotation.some((r) => Math.abs(r) >= 0.001)) ids.push(g.uuid);
+function reportZFighting(res, created, fix, p) {
+	if (!created || !created.length) return res;
+	const auto = !p || p.fix_z_fighting !== false;
+	const found = findZFighting({ focus: created, limit: 2000 });
+	if (!found.length) return res;
+	if (auto) {
+		const r = fixZFighting({ focus: created });
+		res.z_fight_fixed = {
+			pairs_found: found.length,
+			cubes_nudged: r.fixed_cubes.length,
+			how: 'grew the generated cube of each coplanar pair by 0.05 with inflate (box UVs unchanged), so the faces no longer share a plane',
+		};
+		if (typeof Canvas !== 'undefined' && Canvas.updateAll) Canvas.updateAll();
+		if (!r.remaining) return res;
+		res.z_fight_pairs = r.remaining;
+		res.z_fight_examples = r.remaining_examples;
+		res.z_fight_hint = `${r.remaining} pair(s) still share a face plane after the automatic fix. ` + fix;
+		return res;
 	}
-	return ids.join('/');
-}
-
-function coplanarPairsAmong(created) {
-	const isFlat = (c) => c.rotation && c.rotation.every((r) => Math.abs(r) < 0.001);
-	const fresh = created.filter(isFlat);
-	if (!fresh.length) return { pairs: 0, examples: [] };
-	const others = (typeof Cube !== 'undefined' && Cube.all ? Cube.all : []).filter(isFlat);
-	const freshIndex = new Map();
-	fresh.forEach((c, i) => freshIndex.set(c.uuid, i));
-	const ov = (a1, a2, b1, b2) => Math.min(a2, b2) - Math.max(a1, b1);
-	const eps = 0.02;
-	const examples = [];
-	let pairs = 0;
-	for (let i = 0; i < fresh.length && pairs < 200; i++) {
-		const a = fresh[i];
-		for (let j = 0; j < others.length && pairs < 200; j++) {
-			const b = others[j];
-			if (a === b) continue;
-			// Only compare each generated pair once; generated-vs-existing always counts.
-			const bi = freshIndex.get(b.uuid);
-			if (bi !== undefined && bi < i) continue;
-			if (rotatedBoneKey(a) !== rotatedBoneKey(b)) continue;
-			for (let ax = 0; ax < 3; ax++) {
-				const o1 = (ax + 1) % 3, o2 = (ax + 2) % 3;
-				if (ov(a.from[o1], a.to[o1], b.from[o1], b.to[o1]) <= 0.1) continue;
-				if (ov(a.from[o2], a.to[o2], b.from[o2], b.to[o2]) <= 0.1) continue;
-				if (Math.abs(a.from[ax] - b.from[ax]) < eps || Math.abs(a.to[ax] - b.to[ax]) < eps) {
-					pairs++;
-					if (examples.length < 5) examples.push({ cubes: [a.name, b.name], axis: ['x', 'y', 'z'][ax] });
-					break;
-				}
-			}
-		}
-	}
-	return { pairs, examples };
-}
-
-/** Fold a z-fighting report into a generator's result, with a fix to apply. */
-function reportZFighting(res, created, fix) {
-	const { pairs, examples } = coplanarPairsAmong(created);
-	if (!pairs) return res;
-	res.z_fight_pairs = pairs;
-	res.z_fight_examples = examples;
+	res.z_fight_pairs = found.length;
+	res.z_fight_examples = found.slice(0, 5).map((pr) => ({ cubes: [pr.a.cube.name, pr.b.cube.name], faces: [pr.face_a, pr.face_b] }));
 	res.z_fight_hint =
-		`${pairs} pair(s) of these cubes share a face plane and will flicker. ` + fix +
-		' check_model lists every pair as coplanar_overlap.';
+		`${found.length} pair(s) of these cubes share a face plane and will flicker. ` + fix +
+		' Or call fix_z_fighting to nudge them automatically.';
 	return res;
 }
 
@@ -3635,6 +4452,1570 @@ function triangulatePolygon(poly) {
 	if (idx.length === 3) tris.push(idx.slice());
 	else for (let i = 1; i + 1 < idx.length; i++) tris.push([idx[0], idx[i], idx[i + 1]]);
 	return tris;
+}
+
+// ---------------------------------------------------------------------------
+// PAINT ENGINE v2 — material-aware, geometry-aware texture baking
+//
+// What separates a good Blockbench texture from a "recoloured blockout" is not
+// noise. It is: hue-shifted shading (shadows lean cool, lights lean warm),
+// light that depends on which way a face REALLY points (after bones rotate it),
+// a 1px bevel on every edge (lit on top, dark underneath), ambient occlusion
+// where one part tucks under another, a material that reads (metal sheen, hair
+// strands, cloth folds, wood grain) and patterns that continue across cubes.
+// Every pixel here is computed from the 3D point it lands on, so all of that
+// comes out of the geometry instead of being guessed per face.
+// ---------------------------------------------------------------------------
+
+function rgbToHsl(r, g, b) {
+	r /= 255; g /= 255; b /= 255;
+	const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+	let h = 0, s = 0;
+	const l = (mx + mn) / 2;
+	if (mx !== mn) {
+		const d = mx - mn;
+		s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+		if (mx === r) h = (g - b) / d + (g < b ? 6 : 0);
+		else if (mx === g) h = (b - r) / d + 2;
+		else h = (r - g) / d + 4;
+		h *= 60;
+	}
+	return { h, s, l };
+}
+
+function hslToRgb(h, s, l) {
+	h = ((h % 360) + 360) % 360 / 360;
+	if (s <= 0) { const v = clamp8(l * 255); return [v, v, v]; }
+	const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+	const p = 2 * l - q;
+	const f = (t) => {
+		if (t < 0) t += 1;
+		if (t > 1) t -= 1;
+		if (t < 1 / 6) return p + (q - p) * 6 * t;
+		if (t < 1 / 2) return q;
+		if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+		return p;
+	};
+	return [clamp8(f(h + 1 / 3) * 255), clamp8(f(h) * 255), clamp8(f(h - 1 / 3) * 255)];
+}
+
+function hexToRgb(col) {
+	if (Array.isArray(col)) return col.slice(0, 3);
+	const s = String(col || '').trim();
+	if (/^(\$|palette:)/i.test(s)) {
+		const pc = paletteLookup(s);
+		if (pc) return pc;
+		const keys = (typeof Project !== 'undefined' && Project && Project.mcp_palette) ? Object.keys(Project.mcp_palette) : [];
+		throw new Error(`Unknown palette colour "${s}". ${keys.length ? 'Palette keys: ' + keys.join(', ') + '.' : 'No palette yet — run make_palette first.'}`);
+	}
+	const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(s);
+	if (m) {
+		let h = m[1];
+		if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+		return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+	}
+	const c = parseColor(s);
+	return [c.r, c.g, c.b];
+}
+
+function rgbToHex(c) {
+	return '#' + c.map((v) => clamp8(v).toString(16).padStart(2, '0')).join('');
+}
+
+function mixRgb(a, b, t) {
+	return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+
+/** Move hue `h` toward `target` by at most `amount` degrees along the short way round. */
+function hueToward(h, target, amount) {
+	let d = ((target - h + 540) % 360) - 180;
+	if (Math.abs(d) <= amount) return target;
+	return h + Math.sign(d) * amount;
+}
+
+/**
+ * The tone ramp. `v` is -1 (deepest shadow) .. 0 (the base colour) .. +1
+ * (brightest light). Shadows darken, gain saturation and lean toward a cool
+ * hue; lights brighten, lose a little saturation and lean warm. That hue shift
+ * is the single biggest difference between hand-painted pixel art and a
+ * brightness multiplier.
+ */
+function toneRgb(base, v, mat) {
+	const hsl = base.hsl || (base.hsl = rgbToHsl(base.rgb[0], base.rgb[1], base.rgb[2]));
+	let { h, s, l } = hsl;
+	const shift = mat.hue_shift != null ? mat.hue_shift : 12;
+	if (v >= 0) {
+		const t = Math.min(1, v);
+		l = l + (0.97 - l) * t * 0.62;
+		h = hueToward(h, mat.light_hue != null ? mat.light_hue : 50, shift * t);
+		s = s * (1 - 0.22 * t);
+	} else {
+		const t = Math.min(1, -v);
+		const boost = 1 + (mat.shadow_sat != null ? mat.shadow_sat : 0.25) * t;
+		const chroma = (1 - Math.abs(2 * l - 1)) * s;              // HSL s of a pale colour is inflated
+		l = l * (1 - t * 0.62);
+		h = hueToward(h, mat.shadow_hue != null ? mat.shadow_hue : 245, shift * 1.4 * t);
+		// Keep the shadow's colourfulness near the base's: a pale skin must not darken into neon orange.
+		const sChroma = (chroma * boost) / Math.max(0.05, 1 - Math.abs(2 * l - 1));
+		s = Math.min(1, Math.min(s * boost, sChroma) + (s < 0.1 ? 0.07 * t : 0));
+	}
+	return hslToRgb(h, s, l);
+}
+
+// ---- seeded value noise (deterministic, so a re-bake gives the same texture)
+function hash3(x, y, z, seed) {
+	let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(z | 0, 2147483647) + Math.imul(seed | 0, 144665)) | 0;
+	h = Math.imul(h ^ (h >>> 13), 1274126177);
+	h = h ^ (h >>> 16);
+	return (h >>> 0) / 4294967296;
+}
+function vnoise3(x, y, z, seed) {
+	const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+	const xf = x - xi, yf = y - yi, zf = z - zi;
+	const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf), w = zf * zf * (3 - 2 * zf);
+	const L = (a, b, t) => a + (b - a) * t;
+	const c = (dx, dy, dz) => hash3(xi + dx, yi + dy, zi + dz, seed);
+	return L(
+		L(L(c(0, 0, 0), c(1, 0, 0), u), L(c(0, 1, 0), c(1, 1, 0), u), v),
+		L(L(c(0, 0, 1), c(1, 0, 1), u), L(c(0, 1, 1), c(1, 1, 1), u), v),
+		w);
+}
+/** Two-octave fractal noise in -1..1. */
+function fbm3(x, y, z, seed) {
+	return (vnoise3(x, y, z, seed) * 0.65 + vnoise3(x * 2.13, y * 2.13, z * 2.13, seed + 17) * 0.35) * 2 - 1;
+}
+
+// ---- materials --------------------------------------------------------------
+// contrast: how strongly light shapes it. bevel: edge highlight/shadow.
+// noise/nscale: low-frequency mottle. ao: how much occlusion darkens it.
+// The specials (folds, strands, sheen, grain, ...) are read by shadeMaterial().
+const MATERIALS = {
+	matte:    { contrast: 1.0, bevel: 0.55, noise: 0.06, nscale: 0.5, hue_shift: 12, ao: 1 },
+	skin:     { contrast: 0.75, bevel: 0.25, noise: 0.02, nscale: 0.3, hue_shift: 7, shadow_hue: 345, light_hue: 40, shadow_sat: 0.05, ao: 0.6 },
+	cloth:    { contrast: 0.95, bevel: 0.35, noise: 0.04, nscale: 0.6, hue_shift: 12, folds: 0.09, ao: 1 },
+	leather:  { contrast: 1.1, bevel: 0.6, noise: 0.08, nscale: 0.8, hue_shift: 10, stitch: 0.35, ao: 1 },
+	metal:    { contrast: 1.4, bevel: 1.1, noise: 0.025, nscale: 0.3, hue_shift: 8, shadow_hue: 225, sheen: 0.26, scratches: 0.16, ao: 1 },
+	gold:     { contrast: 1.35, bevel: 1.1, noise: 0.03, nscale: 0.35, hue_shift: 16, light_hue: 58, shadow_hue: 15, sheen: 0.32, scratches: 0.1, ao: 1 },
+	wood:     { contrast: 1.0, bevel: 0.5, noise: 0.05, nscale: 0.4, hue_shift: 10, grain: 0.15, ao: 1 },
+	stone:    { contrast: 1.05, bevel: 0.65, noise: 0.13, nscale: 0.45, hue_shift: 10, cracks: 0.22, ao: 1 },
+	hair:     { contrast: 1.1, bevel: 0.35, noise: 0.0, hue_shift: 14, strands: 0.17, shine: 0.3, ao: 1 },
+	fur:      { contrast: 1.0, bevel: 0.3, noise: 0.03, hue_shift: 10, strands: 0.22, ao: 1 },
+	plastic:  { contrast: 1.05, bevel: 0.65, noise: 0.015, nscale: 0.3, hue_shift: 8, sheen: 0.18, ao: 1 },
+	rubber:   { contrast: 0.8, bevel: 0.25, noise: 0.03, nscale: 0.6, hue_shift: 6, ao: 1 },
+	glass:    { contrast: 0.7, bevel: 1.3, noise: 0, hue_shift: 8, sheen: 0.42, ao: 0.35 },
+	crystal:  { contrast: 1.2, bevel: 1.3, noise: 0.03, nscale: 0.8, hue_shift: 20, sheen: 0.38, ao: 0.4 },
+	foliage:  { contrast: 1.1, bevel: 0.4, noise: 0.18, nscale: 1.1, hue_shift: 18, ao: 1 },
+	bone:     { contrast: 0.95, bevel: 0.5, noise: 0.06, nscale: 0.6, hue_shift: 10, ao: 1 },
+	scales:   { contrast: 1.1, bevel: 0.5, noise: 0.03, hue_shift: 14, scale_rows: 1, ao: 1 },
+	emissive: { emissive: true },
+};
+const MATERIAL_ALIASES = {
+	fabric: 'cloth', textile: 'cloth', silk: 'cloth', cotton: 'cloth', wool: 'cloth',
+	steel: 'metal', iron: 'metal', chrome: 'metal', silver: 'metal', copper: 'gold', brass: 'gold', bronze: 'gold',
+	rock: 'stone', brick: 'stone', concrete: 'stone', marble: 'stone',
+	plank: 'wood', bark: 'wood', paper: 'matte', clay: 'matte', paint: 'plastic', enamel: 'plastic',
+	gem: 'crystal', ice: 'crystal', glow: 'emissive', light: 'emissive', flesh: 'skin', feather: 'fur',
+	leaf: 'foliage', leaves: 'foliage', moss: 'foliage', grass: 'foliage',
+};
+
+/** Guess a material from a cube name — the fallback when a rule names none. */
+function materialFromName(name) {
+	const n = String(name || '').toLowerCase();
+	const rules = [
+		[/(_core|_glow|emissive|lamp|bulb|led|rune)/, 'emissive'],
+		[/(hair|bang|fringe|ponytail|pigtail|twin_?tail|braid|ahoge|lock)/, 'hair'],
+		[/(gold|brass|bronze|copper|coin)/, 'gold'],
+		[/(metal|steel|iron|armou?r|plate|bolt|rivet|gear|cog|blade|sword|axle|piston|pipe|chain|buckle|helmet|gauntlet|pauldron)/, 'metal'],
+		[/(wood|plank|log|handle|shaft|crate|barrel|staff|bow_limb)/, 'wood'],
+		[/(stone|rock|brick|boulder|pillar|statue)/, 'stone'],
+		[/(gem|crystal|ice|glass|lens|visor)/, 'crystal'],
+		[/(leather|belt|strap|boot|glove|holster|pouch|saddle)/, 'leather'],
+		[/(skin|face|head|neck|hand|finger|palm|cheek|ear(?!th))/, 'skin'],
+		[/(fur|mane|pelt|tuft|feather)/, 'fur'],
+		[/(leaf|leaves|foliage|grass|moss|vine|bush)/, 'foliage'],
+		[/(bone|skull|rib|tooth|teeth|horn|tusk|claw)/, 'bone'],
+		[/(cloth|shirt|skirt|dress|cloak|cape|robe|sleeve|sock|stocking|scarf|ribbon|bow|collar|hood|tunic|pants|trouser|shorts|apron|coat|jacket|top|hem|lace|frill)/, 'cloth'],
+		[/(scale)/, 'scales'],
+		[/(rubber|tire|tyre)/, 'rubber'],
+	];
+	for (const [re, m] of rules) if (re.test(n)) return m;
+	return 'matte';
+}
+
+function resolveMaterial(rule, cubeName) {
+	let id = rule && rule.material ? String(rule.material).toLowerCase() : null;
+	if (id && MATERIAL_ALIASES[id]) id = MATERIAL_ALIASES[id];
+	if (!id || !MATERIALS[id]) id = materialFromName(cubeName);
+	const mat = Object.assign({ id }, MATERIALS[id]);
+	if (rule) {
+		for (const k of ['contrast', 'bevel', 'noise', 'nscale', 'hue_shift', 'shadow_hue', 'light_hue', 'shadow_sat', 'ao', 'folds', 'strands', 'shine', 'sheen', 'scratches', 'grain', 'cracks', 'stitch']) {
+			if (rule[k] != null && isFinite(Number(rule[k]))) mat[k] = Number(rule[k]);
+		}
+		if (rule.emissive != null) mat.emissive = !!rule.emissive;
+	}
+	return mat;
+}
+
+/** First rule whose `match` regex hits the cube name (rules may use `color`/`base`). */
+function ruleFor(name, rules) {
+	if (!Array.isArray(rules)) {
+		if (rules && typeof rules === 'object') {
+			for (const key in rules) {
+				try { if (new RegExp(key, 'i').test(name)) return typeof rules[key] === 'string' ? { color: rules[key] } : rules[key]; } catch (e) {}
+			}
+		}
+		return null;
+	}
+	for (const r of rules) {
+		if (!r) continue;
+		if (!r.match) continue;
+		try { if (new RegExp(r.match, 'i').test(name)) return r; } catch (e) {}
+	}
+	return null;
+}
+
+// ---- face geometry: texture pixel -> 3D point ---------------------------------
+/**
+ * Stored-frame position of a UV point on a cube face. Same mapping as
+ * Blockbench's CubeFace.UVToLocal (face rotation, flipped UVs and inflate
+ * included); used directly when that API exists.
+ */
+function faceUVToStored(cube, dir, face, u, v) {
+	if (face && typeof face.UVToLocal === 'function') {
+		try {
+			const p = face.UVToLocal([u, v]);
+			return [p.x + cube.origin[0], p.y + cube.origin[1], p.z + cube.origin[2]];
+		} catch (e) { /* fall through to the port */ }
+	}
+	const box = cubeLocalBox(cube);
+	const t = box.min, n = box.max;
+	const uv = face.uv;
+	let o = (u - uv[0]) / ((uv[2] - uv[0]) || 1e-9);
+	let r = (v - uv[1]) / ((uv[3] - uv[1]) || 1e-9);
+	for (let s = 0; s < (face.rotation || 0); s += 90) { const tmp = o; o = 1 - r; r = tmp; }
+	const L = (a, b, k) => a + (b - a) * k;
+	const a = t.slice();
+	switch (dir) {
+		case 'east': a[0] = n[0]; a[1] = L(n[1], t[1], r); a[2] = L(n[2], t[2], o); break;
+		case 'west': a[1] = L(n[1], t[1], r); a[2] = L(t[2], n[2], o); break;
+		case 'up': a[1] = n[1]; a[2] = L(t[2], n[2], r); a[0] = L(t[0], n[0], o); break;
+		case 'down': a[2] = L(n[2], t[2], r); a[0] = L(t[0], n[0], o); break;
+		case 'south': a[2] = n[2]; a[1] = L(n[1], t[1], r); a[0] = L(t[0], n[0], o); break;
+		case 'north': a[1] = L(n[1], t[1], r); a[0] = L(n[0], t[0], o); break;
+	}
+	return a;
+}
+
+/**
+ * Everything needed to shade one face pixel by pixel: its pixel rect, an
+ * affine map from pixel to WORLD position, its world normal and tangents, and
+ * which way each of its four pixel edges points in the world.
+ */
+function facePaintFrame(cube, dir, face, scale, X) {
+	const r = faceRect(face, scale);
+	if (r.w <= 0 || r.h <= 0) return null;
+	const uv = face.uv;
+	if (Math.abs(uv[2] - uv[0]) < 1e-6 || Math.abs(uv[3] - uv[1]) < 1e-6) return null;
+	const W = (p) => xformPoint(X, p);
+	const P00 = W(faceUVToStored(cube, dir, face, uv[0], uv[1]));
+	const P10 = W(faceUVToStored(cube, dir, face, uv[2], uv[1]));
+	const P01 = W(faceUVToStored(cube, dir, face, uv[0], uv[3]));
+	const du = [P10[0] - P00[0], P10[1] - P00[1], P10[2] - P00[2]];
+	const dv = [P01[0] - P00[0], P01[1] - P00[1], P01[2] - P00[2]];
+	const iu = 1 / (uv[2] - uv[0]), iv = 1 / (uv[3] - uv[1]);
+	/** World position of texture pixel (px,py) centre (absolute canvas pixels). */
+	const at = (px, py) => {
+		const s = ((px + 0.5) / scale - uv[0]) * iu;
+		const t = ((py + 0.5) / scale - uv[1]) * iv;
+		return [P00[0] + du[0] * s + dv[0] * t, P00[1] + du[1] * s + dv[1] * t, P00[2] + du[2] * s + dv[2] * t];
+	};
+	const normal = vecNorm(matApply(X.R, FACE_GEOM[dir].n));
+	const center = at(r.x + r.w / 2 - 0.5, r.y + r.h / 2 - 0.5);
+	const edgeDir = (px, py) => vecNorm(vecAdd(at(px, py), vecNeg(center)));
+	const edges = {
+		left: edgeDir(r.x - 0.5, r.y + r.h / 2 - 0.5),
+		right: edgeDir(r.x + r.w - 0.5, r.y + r.h / 2 - 0.5),
+		top: edgeDir(r.x + r.w / 2 - 0.5, r.y - 0.5),
+		bottom: edgeDir(r.x + r.w / 2 - 0.5, r.y + r.h - 0.5),
+	};
+	const corners = [at(r.x - 0.5, r.y - 0.5), at(r.x + r.w - 0.5, r.y - 0.5), at(r.x - 0.5, r.y + r.h - 0.5), at(r.x + r.w - 0.5, r.y + r.h - 0.5)];
+	const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+	corners.forEach((c) => { for (let k = 0; k < 3; k++) { min[k] = Math.min(min[k], c[k]); max[k] = Math.max(max[k], c[k]); } });
+	const t1 = vecNorm(du), t2 = vecNorm(dv);
+	return { r, at, normal, edges, min, max, t1, t2, widthUnits: Math.hypot(...du), heightUnits: Math.hypot(...dv) };
+}
+
+/** Occluders near a face, with the inverse transforms needed for point tests. */
+function occludersNear(frame, selfCube, infos, radius) {
+	const box = { min: frame.min.map((v) => v - radius), max: frame.max.map((v) => v + radius) };
+	const out = [];
+	for (const inf of infos) {
+		if (inf.cube === selfCube) continue;
+		if (!aabbOverlap(inf, box, 0)) continue;
+		out.push(inf);
+	}
+	return out;
+}
+
+function pointInInfo(inf, p, eps) {
+	const RT = inf.RT || (inf.RT = matTranspose(inf.X.R));
+	const q = matApply(RT, [p[0] - inf.X.t[0], p[1] - inf.X.t[1], p[2] - inf.X.t[2]]);
+	const e = eps || 0;
+	return q[0] > inf.box.min[0] - e && q[0] < inf.box.max[0] + e &&
+		q[1] > inf.box.min[1] - e && q[1] < inf.box.max[1] + e &&
+		q[2] > inf.box.min[2] - e && q[2] < inf.box.max[2] + e;
+}
+
+/** Fraction (0..1) of short rays above a surface point that run into other geometry. */
+function occlusionAt(p, frame, occ, nearOnly) {
+	if (!occ.length) return 0;
+	const n = frame.normal, a = frame.t1, b = frame.t2;
+	// Covered by another cube: the pixel is hidden; paint it as a deep crevice.
+	const lift = [p[0] + n[0] * 0.03, p[1] + n[1] * 0.03, p[2] + n[2] * 0.03];
+	for (const inf of occ) if (pointInInfo(inf, lift, -0.01)) return 1;
+	const dirs = [
+		n,
+		vecNorm([n[0] + a[0] * 0.8, n[1] + a[1] * 0.8, n[2] + a[2] * 0.8]),
+		vecNorm([n[0] - a[0] * 0.8, n[1] - a[1] * 0.8, n[2] - a[2] * 0.8]),
+		vecNorm([n[0] + b[0] * 0.8, n[1] + b[1] * 0.8, n[2] + b[2] * 0.8]),
+		vecNorm([n[0] - b[0] * 0.8, n[1] - b[1] * 0.8, n[2] - b[2] * 0.8]),
+	];
+	// nearOnly: just the contact line where parts meet (cel shading: wide soft AO would be
+	// cut into big flat dark blocks by the hard tone bands).
+	const radii = nearOnly ? [0.3] : [0.45, 1.1, 2.0];
+	const weights = nearOnly ? [1] : [1, 0.6, 0.3];
+	let hit = 0, total = 0;
+	for (let ri = 0; ri < radii.length; ri++) {
+		for (const d of dirs) {
+			const q = [p[0] + d[0] * radii[ri], p[1] + d[1] * radii[ri], p[2] + d[2] * radii[ri]];
+			total += weights[ri];
+			for (const inf of occ) {
+				if (pointInInfo(inf, q, 0)) { hit += weights[ri]; break; }
+			}
+		}
+	}
+	return total ? hit / total : 0;
+}
+
+// ---- patterns ----------------------------------------------------------------
+const frac = (x) => x - Math.floor(x);
+
+/** 2D pattern coordinates (in units) for a world point: triplanar on the face normal. */
+function patternCoords(p, n, space, frameLocal) {
+	if (space === 'face' && frameLocal) return frameLocal;
+	const ax = Math.abs(n[0]), ay = Math.abs(n[1]), az = Math.abs(n[2]);
+	if (ay >= ax && ay >= az) return [p[0], p[2]];
+	if (ax >= az) return [n[0] > 0 ? -p[2] : p[2], p[1]];
+	return [n[2] > 0 ? p[0] : -p[0], p[1]];
+}
+
+/**
+ * Apply one pattern to the pixel. Mutates `px` ({rgb, dv}) — base colour
+ * changes are shaded afterwards, so a plaid or a hazard stripe gets the same
+ * light, bevel and AO as everything else.
+ */
+function applyPattern(pat, px, ctx) {
+	const type = String(pat.type || '').toLowerCase();
+	const [pu0, pv0] = patternCoords(ctx.p, ctx.n, pat.space, ctx.faceUV);
+	const off = numN(pat.offset, 2, [0, 0]);
+	const pu = pu0 + off[0], pv = pv0 + off[1];
+	const col = pat.color ? hexToRgb(pat.color) : null;
+	const col2 = pat.color2 ? hexToRgb(pat.color2) : null;
+	const ix = ctx.ix, iy = ctx.iy;
+	switch (type) {
+		case 'plaid': case 'tartan': case 'check': {
+			const size = numOr(pat.size, 4);
+			const band = numOr(pat.band, 0.36);
+			const line = numOr(pat.line, 0.07);
+			const bc = col || [24, 18, 22];
+			const fu = frac(pu / size), fv = frac(pv / size);
+			const inU = fu < band, inV = fv < band;
+			const bandPx = size * band * ctx.ppu;
+			if (inU && inV) px.rgb = mixRgb(px.rgb, bc, 0.9);
+			else if (inU || inV) {
+				// twill: on wide bands a 2x2 hatch reads as woven cloth; on narrow
+				// ones it is just noise, so blend flat.
+				if (bandPx >= 3 && pat.twill !== false) px.rgb = mixRgb(px.rgb, bc, ((ix + iy) & 1) === 0 ? 0.75 : 0.3);
+				else px.rgb = mixRgb(px.rgb, bc, 0.5);
+			}
+			if (col2) {
+				const lu = Math.abs(fu - (band + (1 - band) / 2)) < line / 2;
+				const lv = Math.abs(fv - (band + (1 - band) / 2)) < line / 2;
+				if (lu || lv) px.rgb = mixRgb(px.rgb, col2, 0.8);
+			}
+			break;
+		}
+		case 'stripes': {
+			const w = numOr(pat.width, 1), gap = numOr(pat.gap, 1);
+			const dirw = String(pat.direction || 'horizontal');
+			const c = dirw === 'vertical' ? pu : dirw === 'diagonal' ? (pu + pv) * 0.7071 : pv;
+			if (frac(c / (w + gap)) < w / (w + gap)) px.rgb = col || mixRgb(px.rgb, [0, 0, 0], 0.5);
+			break;
+		}
+		case 'checker': {
+			const s = numOr(pat.size, 1);
+			if (((Math.floor(pu / s) + Math.floor(pv / s)) & 1) === 0) px.rgb = col || mixRgb(px.rgb, [0, 0, 0], 0.4);
+			break;
+		}
+		case 'dots': case 'polka': {
+			const sp = numOr(pat.spacing, 3), rad = numOr(pat.radius, 0.6);
+			const row = Math.floor(pv / sp);
+			const du = frac(pu / sp + (row & 1) * 0.5) * sp - sp / 2, dv = frac(pv / sp) * sp - sp / 2;
+			if (du * du + dv * dv < rad * rad) px.rgb = col || [255, 255, 255];
+			break;
+		}
+		case 'panels': case 'panel_lines': {
+			const sp = numN(pat.spacing != null ? pat.spacing : 4, 2, [4, 4]);
+			const lw = 1 / ctx.ppu;
+			const fu = frac(pu / sp[0]) * sp[0], fv = frac(pv / sp[1]) * sp[1];
+			const onU = fu < lw, onV = fv < lw;
+			if (onU || onV) { px.dv -= 0.42; if (col) px.rgb = col; }
+			else if (fu < 2 * lw || fv < 2 * lw) px.dv += 0.12; // lit lip beside the groove
+			if (pat.rivets !== false) {
+				const ins = 1.5 * lw;
+				const near = (f, s) => Math.abs(f - ins) < lw * 0.55 || Math.abs(f - (s - ins)) < lw * 0.55;
+				if (near(fu, sp[0]) && near(fv, sp[1])) { px.dv += 0.38; if (pat.rivet_color) px.rgb = hexToRgb(pat.rivet_color); }
+			}
+			break;
+		}
+		case 'grille': case 'vent': case 'vents': {
+			const sp = numOr(pat.spacing, 1);
+			const slot = numOr(pat.slot, 0.5);
+			const dirw = String(pat.direction || 'horizontal');
+			const c = dirw === 'vertical' ? pu : pv;
+			const f = frac(c / sp);
+			if (f < slot) { px.dv -= 0.62; if (col) px.rgb = col; }
+			else if (f < slot + 1 / (ctx.ppu * sp)) px.dv += 0.18;
+			break;
+		}
+		case 'hazard': {
+			const w = numOr(pat.width, 1.5);
+			const a = col || [242, 194, 27], b = col2 || [26, 26, 26];
+			px.rgb = frac((pu + pv) / (2 * w)) < 0.5 ? a : b;
+			break;
+		}
+		case 'bricks': {
+			const sz = numN(pat.size, 2, [4, 2]);
+			const row = Math.floor(pv / sz[1]);
+			const fu = frac(pu / sz[0] + (row & 1) * 0.5) * sz[0];
+			const fv = frac(pv / sz[1]) * sz[1];
+			const lw = 1 / ctx.ppu;
+			if (fu < lw || fv < lw) { px.rgb = col || mixRgb(px.rgb, [40, 36, 34], 0.6); px.dv -= 0.15; }
+			else px.dv += (hash3(Math.floor(pu / sz[0] + (row & 1) * 0.5), row, 7, ctx.seed) - 0.5) * 0.18;
+			break;
+		}
+		case 'planks': {
+			const w = numOr(pat.width, 3);
+			const lw = 1 / ctx.ppu;
+			const across = String(pat.direction || 'horizontal') === 'vertical' ? pu : pv;
+			const along = String(pat.direction || 'horizontal') === 'vertical' ? pv : pu;
+			const idx = Math.floor(across / w);
+			if (frac(across / w) * w < lw) { px.dv -= 0.45; if (col) px.rgb = col; }
+			else px.dv += (hash3(idx, 3, 1, ctx.seed) - 0.5) * 0.16 + 0.08 * Math.sin(along * 1.7 + idx * 2.1 + vnoise3(along * 0.5, idx, 0, ctx.seed) * 3);
+			break;
+		}
+		case 'scales': {
+			const s = numOr(pat.size, 2);
+			const row = Math.floor(pv / s);
+			const fu = frac(pu / s + (row & 1) * 0.5) - 0.5, fv = frac(pv / s);
+			const d = Math.sqrt(fu * fu + (fv - 1) * (fv - 1));
+			if (d > 0.62) px.dv -= 0.3; else px.dv += (0.62 - d) * 0.35;
+			if (col && d > 0.55) px.rgb = col;
+			break;
+		}
+		case 'trim': case 'border': case 'lace': {
+			// Face-relative: a band of `width` pixels along the chosen edges.
+			const width = Math.max(1, Math.round(numOr(pat.width, 1)));
+			const edges = toList(pat.edges || pat.edge || 'all').map((e) => String(e).toLowerCase());
+			const want = (e) => edges.includes('all') || edges.includes(e);
+			const style = String(pat.style || (type === 'lace' ? 'zigzag' : 'solid'));
+			const dist = ctx.edgeDist; // {left,right,top,bottom} in pixels
+			let on = false;
+			for (const e of ['top', 'bottom', 'left', 'right']) {
+				if (!want(ctx.worldEdge[e])) continue;
+				let wdt = width;
+				if (style === 'zigzag') {
+					// triangle teeth: 1px at the valleys, width+1 px at the points
+					const along = (e === 'top' || e === 'bottom') ? ctx.lx : ctx.ly;
+					const period = Math.max(2, width * 2);
+					const tri = Math.abs((along % period) - width);
+					wdt = width - tri + 1;
+				}
+				if (style === 'dashed') {
+					const along = (e === 'top' || e === 'bottom') ? ctx.lx : ctx.ly;
+					if (dist[e] < width && (along & 1) === 0) on = true;
+					continue;
+				}
+				if (dist[e] < wdt) on = true;
+			}
+			if (on) px.rgb = col || [240, 240, 240];
+			break;
+		}
+		case 'gradient': {
+			const to = col || [0, 0, 0];
+			const dirw = String(pat.direction || 'down');
+			const lo = ctx.cubeMin[1], hi = ctx.cubeMax[1];
+			let k = hi > lo ? (ctx.p[1] - lo) / (hi - lo) : 0.5; // 0 bottom .. 1 top
+			if (dirw === 'down') k = 1 - k;
+			const start = numOr(pat.start, 0.5);
+			const amt = Math.max(0, Math.min(1, (k - start) / Math.max(0.01, 1 - start)));
+			px.rgb = mixRgb(px.rgb, to, amt * numOr(pat.strength, 1));
+			break;
+		}
+		case 'noise': case 'speckle': {
+			const amt = numOr(pat.amount, 0.15);
+			if (hash3(ix, iy, 31, ctx.seed) < numOr(pat.density, 0.12)) {
+				if (col) px.rgb = mixRgb(px.rgb, col, 0.7); else px.dv += (hash3(ix, iy, 5, ctx.seed) - 0.5) * 2 * amt;
+			}
+			break;
+		}
+		default:
+			break;
+	}
+}
+
+/** Material specials that add tone (folds, strands, sheen, grain, ...). */
+function shadeMaterial(mat, ctx) {
+	let dv = 0;
+	const p = ctx.p, n = ctx.n, seed = ctx.seed;
+	const side = Math.abs(n[1]) < 0.7;
+	const [pu] = patternCoords(p, n);
+	if (mat.noise) dv += mat.noise * fbm3(p[0] * (mat.nscale || 0.5), p[1] * (mat.nscale || 0.5), p[2] * (mat.nscale || 0.5), seed);
+	if (mat.folds && side) {
+		const ph = vnoise3(pu * 0.35, p[1] * 0.15, 0, seed + 3) * 4;
+		dv += mat.folds * Math.sin(pu * 2.4 + ph) * (0.55 + 0.45 * (1 - ctx.cubeH));
+	}
+	if (mat.strands) {
+		// Anisotropic: long along the hair flow (down the sides, front-to-back on top).
+		const along = side ? p[1] : p[2];
+		const across = side ? pu : p[0];
+		if (ctx.finish === 'cel') {
+			// Cel shading cuts soft noise into blotches; anime hair is flat colour with a
+			// few clean strand lines that wander slightly as they run down.
+			const g = frac(across * 0.6 + vnoise3(along * 0.09, across * 0.2, 3, seed + 14) * 0.7);
+			if (g < 0.11) dv -= 0.42;
+			else if (g > 0.55 && g < 0.6 && ctx.partH > 0.45) dv += 0.25;
+		} else {
+			const s = vnoise3(across * 1.7, along * 0.16, 0, seed + 11) * 0.7 + vnoise3(across * 3.6, along * 0.3, 1, seed + 12) * 0.3;
+			dv += mat.strands * (s * 2 - 1);
+			if (side) dv -= 0.07 * (1 - ctx.cubeH);
+		}
+	}
+	if (mat.shine && side) {
+		const across = pu;
+		const centre = 0.74 + (vnoise3(across * 1.3, 0, 2, seed + 13) - 0.5) * 0.12;
+		const band = Math.exp(-Math.pow(((ctx.partH != null ? ctx.partH : ctx.cubeH) - centre) / 0.07, 2));
+		dv += mat.shine * band;
+	}
+	if (mat.sheen) {
+		const d = (ctx.fs + (1 - ctx.ft)) / 2;
+		dv += mat.sheen * Math.exp(-Math.pow((d - 0.66) / 0.11, 2)) * (n[1] < -0.7 ? 0 : 1);
+	}
+	if (mat.scratches && hash3(ctx.ix, ctx.iy, 77, seed) < 0.012) dv += mat.scratches;
+	if (mat.grain) {
+		// Grain runs along the cube's longest axis.
+		const ax = ctx.longAxis;
+		const along = p[ax], across = ax === 1 ? pu : p[1] + (ax === 0 ? p[2] : p[0]) * 0.5;
+		const g = frac(across * 1.1 + vnoise3(along * 0.18, across * 0.6, 0, seed + 21) * 1.6);
+		if (g < 0.22) dv -= mat.grain;
+		else if (g < 0.3) dv += mat.grain * 0.35;
+	}
+	if (mat.cracks) {
+		const c = Math.abs(fbm3(p[0] * 0.55, p[1] * 0.55, p[2] * 0.55, seed + 31));
+		if (c < 0.045) dv -= mat.cracks;
+	}
+	// One seam of stitches 1px under the top edge of larger side faces — stitching every
+	// edge of every face turns small parts into a dotted grid.
+	if (mat.stitch && side && ctx.faceMinPx >= 8 && ctx.edgeDist && ctx.edgeDist.top === 1 && ctx.lx % 3 === 1) dv += mat.stitch;
+	if (mat.scale_rows) {
+		const s = 1.6, row = Math.floor(p[1] / s);
+		const fu = frac(pu / s + (row & 1) * 0.5) - 0.5, fv = frac(p[1] / s);
+		const d = Math.sqrt(fu * fu + (fv - 1) * (fv - 1));
+		dv += d > 0.6 ? -0.28 : (0.6 - d) * 0.3;
+	}
+	return dv;
+}
+
+const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
+/**
+ * Bake every chosen face. Returns stats. `opts`:
+ *   rules[], base, ao, bevel, light, seed, finish ('painted'|'pixel'|'cel'),
+ *   ground_dark, vary, glow_re.
+ */
+function paintEngineBake(tex, cubes, opts) {
+	const scale = tex.width / (Project.texture_width || tex.width);
+	const ppu = scale; // texture pixels per model unit (box UV maps 1 UV unit to 1 unit)
+	const seed = opts.seed != null ? (Number(opts.seed) | 0) : 1337;
+	const aoAmt = opts.ao != null ? Number(opts.ao) : 0.55;
+	const bevelAmt = opts.bevel != null ? Number(opts.bevel) : 1;
+	const finish = String(opts.finish || 'painted');
+	const L = vecNorm(num3(opts.light, [0, 1, -0.5]));
+	const groundDark = opts.ground_dark != null ? Number(opts.ground_dark) : 0.1;
+	const vary = opts.vary != null ? Number(opts.vary) : 0.035;
+	const glowRe = opts.glow_re || /_core$|_glow$/i;
+
+	const allInfos = Cube.all.filter((c) => c.visibility !== false).map(cubeWorldInfo);
+	let minY = Infinity, maxY = -Infinity;
+	allInfos.forEach((i) => { minY = Math.min(minY, i.min[1]); maxY = Math.max(maxY, i.max[1]); });
+	const spanY = Math.max(1e-6, maxY - minY);
+
+	const stats = { faces: 0, pixels: 0, materials: {}, uv_overlap_pixels: 0 };
+	const owner = new Int32Array(tex.width * tex.height).fill(-1);
+
+	// Height span of each PART (all cubes one rule paints, e.g. all the hair), measured on its
+	// bigger pieces so tails and strands do not stretch it. Light gradients and the hair shine
+	// follow the part, so the tone lines run on across neighbouring cubes instead of each cube
+	// getting its own cut at its own height (with cel bands that read as a slipped texture).
+	const partSpan = new Map();
+	{
+		const byRule = new Map();
+		allInfos.forEach((inf) => {
+			const rule = ruleFor(inf.cube.name, opts.rules);
+			if (!rule) return;
+			if (!byRule.has(rule)) byRule.set(rule, []);
+			byRule.get(rule).push(inf);
+		});
+		byRule.forEach((list, rule) => {
+			const vmax = Math.max(...list.map((i) => i.volume));
+			const big = list.filter((i) => i.volume >= vmax * 0.25);
+			const lo = Math.min(...big.map((i) => i.min[1])), hi = Math.max(...big.map((i) => i.max[1]));
+			partSpan.set(rule, { lo, span: Math.max(1e-6, hi - lo) });
+		});
+	}
+
+	tex.edit((canvas) => {
+		const ctx2d = canvas.getContext('2d');
+		ctx2d.imageSmoothingEnabled = false;
+		const W = canvas.width, H = canvas.height;
+		const img = ctx2d.getImageData(0, 0, W, H);
+		const data = img.data;
+		cubes.forEach((cube, ci) => {
+			const rule = ruleFor(cube.name, opts.rules) || {};
+			const part = partSpan.get(rule) || null;
+			const mat = resolveMaterial(rule, cube.name);
+			if (glowRe.test(cube.name)) mat.emissive = true;
+			stats.materials[mat.id] = (stats.materials[mat.id] || 0) + 1;
+			const baseRgb0 = hexToRgb(rule.color || rule.base || opts.base || '#9c9c9c');
+			// Per-cube variation so a row of identical shingles does not look stamped.
+			const jv = (hash3(ci, 1, 2, seed) - 0.5) * 2 * vary;
+			const baseRgb = baseRgb0.map((v) => v * (1 + jv));
+			const patterns = toList(maybeParse(rule.pattern || rule.patterns || [])).map(maybeParse).filter(Boolean);
+			const X = nodeWorld(cube);
+			const info = cubeWorldInfo(cube);
+			const sizeW = info.size;
+			const longAxis = sizeW[0] >= sizeW[1] && sizeW[0] >= sizeW[2] ? 0 : sizeW[1] >= sizeW[2] ? 1 : 2;
+			for (const dir in cube.faces) {
+				const face = cube.faces[dir];
+				if (!face || face.enabled === false) continue;
+				face.texture = tex.uuid;
+				const frame = facePaintFrame(cube, dir, face, scale, X);
+				if (!frame) continue;
+				const r = frame.r;
+				const occ = aoAmt > 0 && !mat.emissive ? occludersNear(frame, cube, allInfos, 2.1) : [];
+				// Which world direction each pixel edge of this face points.
+				const worldEdge = {};
+				for (const e of ['top', 'bottom', 'left', 'right']) {
+					const d = frame.edges[e];
+					worldEdge[e] = Math.abs(d[1]) > 0.7 ? (d[1] > 0 ? 'top' : 'bottom') : (frame.normal[1] > 0.7 || frame.normal[1] < -0.7 ? 'side' : 'side');
+				}
+				// Light by the face's REST direction (the cube's own rotation, not the bones'): a
+				// texture is shared by every pose, so a head tilted in the display pose must not
+				// bake a darker cheek on one side. Contact shadow (AO) still uses the real pose.
+				const restN = vecNorm(matApply(eulerToMat(cube.rotation || [0, 0, 0]), FACE_GEOM[dir].n));
+				const isUp = restN[1] > 0.7, isDown = restN[1] < -0.7;
+				const lightTone = mat.emissive ? 0 : (mat.contrast || 1) * (0.41 * vecDot(restN, L) - 0.075);
+				stats.faces++;
+				for (let j = 0; j < r.h; j++) {
+					const py = r.y + j;
+					if (py < 0 || py >= H) continue;
+					for (let i = 0; i < r.w; i++) {
+						const pxx = r.x + i;
+						if (pxx < 0 || pxx >= W) continue;
+						const idx = py * W + pxx;
+						if (owner[idx] !== -1 && owner[idx] !== ci) stats.uv_overlap_pixels++;
+						owner[idx] = ci;
+						const p = frame.at(pxx, py);
+						const edgeDist = { left: i, right: r.w - 1 - i, top: j, bottom: r.h - 1 - j };
+						const minEdge = Math.min(edgeDist.left, edgeDist.right, edgeDist.top, edgeDist.bottom);
+						const cubeH = (p[1] - info.min[1]) / Math.max(1e-6, info.max[1] - info.min[1]);
+						const partH = part ? Math.max(0, Math.min(1, (p[1] - part.lo) / part.span)) : cubeH;
+						const pxState = { rgb: baseRgb.slice(), dv: 0 };
+						const pctx = { finish,
+							p, n: frame.normal, ix: pxx, iy: py, lx: i, ly: j, seed, ppu,
+							fs: (i + 0.5) / r.w, ft: (j + 0.5) / r.h, edgeDist, minEdge, worldEdge,
+							cubeMin: info.min, cubeMax: info.max, cubeH, partH, longAxis, faceMinPx: Math.min(r.w, r.h),
+							faceUV: [(i + 0.5) / ppu, (r.h - j - 0.5) / ppu],
+						};
+						for (const pat of patterns) applyPattern(pat, pxState, pctx);
+						let v;
+						if (mat.emissive) {
+							const cx = (i + 0.5) / r.w - 0.5, cy = (j + 0.5) / r.h - 0.5;
+							v = 0.42 - Math.sqrt(cx * cx + cy * cy) * 0.55 + pxState.dv;
+						} else {
+							v = lightTone + pxState.dv;
+							// in-face gradient: light falls from above
+							if (!isUp && !isDown) v += 0.16 * (mat.contrast || 1) * ((finish === 'cel' ? partH : cubeH) - 0.5);
+							v -= groundDark * (1 - (p[1] - minY) / spanY);
+							// bevel: the outermost pixel ring catches or loses light by edge direction
+							if (minEdge <= 1 && Math.min(r.w, r.h) >= 2) {
+								const ring = minEdge === 0 ? 1 : (Math.min(r.w, r.h) >= 6 ? 0.35 : 0);
+								if (ring) {
+									let b = 0;
+									for (const e of ['top', 'bottom', 'left', 'right']) {
+										if (edgeDist[e] !== minEdge) continue;
+										const d = frame.edges[e];
+										if (isUp) b += 0.16;
+										else if (isDown) b -= 0.06;
+										else b += 0.24 * Math.max(0, d[1]) - 0.2 * Math.max(0, -d[1]) + 0.08 * (d[0] * L[0] + d[2] * L[2]);
+									}
+									v += b * ring * (mat.bevel != null ? mat.bevel : 0.5) * bevelAmt;
+								}
+							}
+							v += shadeMaterial(mat, pctx);
+							if (occ.length) {
+								const o = occlusionAt(p, frame, occ, finish === 'cel');
+								v -= aoAmt * (mat.ao != null ? mat.ao : 1) * (finish === 'cel' ? (o >= 1 ? 1 : o * 0.75) : o * 0.9);
+							}
+						}
+						if (finish === 'pixel') {
+							const steps = 7;
+							const th = (BAYER4[(py & 3) * 4 + (pxx & 3)] / 16 - 0.5) / steps;
+							v = Math.round((v + th) * steps) / steps;
+						} else if (finish === 'cel') {
+							v = v > 0.18 ? 0.3 : v < -0.18 ? -0.4 : 0;
+						}
+						if (v > 1) v = 1; else if (v < -1) v = -1;
+						const base = { rgb: pxState.rgb };
+						const c = toneRgb(base, v, mat);
+						const o = idx * 4;
+						data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = 255;
+						stats.pixels++;
+					}
+				}
+			}
+		});
+		ctx2d.putImageData(img, 0, 0);
+	}, { edit_name: 'MCP: paint model', no_undo: false });
+	return stats;
+}
+
+// ---------------------------------------------------------------------------
+// FACE PAINTER — eyes, brows, mouth, blush, drawn as pixel art in the face's
+// own grid. The head is the first thing anyone looks at and the place AI
+// models fail hardest ("two black squares"), so the pixel recipes live here
+// instead of in the model's head. Works from an 8x8 Minecraft face up to a
+// 32x32 HD one, and always paints upright as seen by someone facing the model.
+// ---------------------------------------------------------------------------
+
+const FACE_STYLES = ['anime', 'cartoon', 'minecraft', 'beady', 'chibi'];
+
+/**
+ * Map every texture pixel of a face to a cell of an upright face grid (x right, y down,
+ * as seen by someone facing it). "Up" is the cube's own up — its rotation and every bone
+ * above it — so a head tilted by its bone keeps the grid on the texture's pixel grid and
+ * nothing is resampled at an angle (which made eyes crooked and uneven).
+ */
+function faceGrid(frame, X, scale) {
+	const N = frame.normal;
+	// "Up" is the HEAD's up (its own rotation and every bone above it), not the world's:
+	// a head tilted by its bone keeps the face grid on the texture's pixel grid, so the
+	// features are not resampled at an angle (which made the eyes crooked and uneven).
+	const o0 = xformPoint(X, [0, 0, 0]);
+	const dirW = (v) => { const q = xformPoint(X, v); return vecNorm([q[0] - o0[0], q[1] - o0[1], q[2] - o0[2]]); };
+	let up = dirW([0, 1, 0]);
+	if (Math.abs(vecDot(up, N)) > 0.9) up = dirW(orientation().front_vec);
+	const k = vecDot(up, N);
+	up = vecNorm([up[0] - N[0] * k, up[1] - N[1] * k, up[2] - N[2] * k]);
+	const right = vecNorm(vecCross(vecNeg(N), up));
+	const r = frame.r;
+	const cells = [];
+	let minX = Infinity, minY = Infinity;
+	for (let j = 0; j < r.h; j++) for (let i = 0; i < r.w; i++) {
+		const q = frame.at(r.x + i, r.y + j);
+		const cx = vecDot(q, right), cy = -vecDot(q, up);
+		cells.push([i, j, cx, cy]);
+		minX = Math.min(minX, cx); minY = Math.min(minY, cy);
+	}
+	let Wf = 0, Hf = 0;
+	cells.forEach((c) => {
+		c[2] = Math.round((c[2] - minX) * scale);
+		c[3] = Math.round((c[3] - minY) * scale);
+		Wf = Math.max(Wf, c[2] + 1); Hf = Math.max(Hf, c[3] + 1);
+	});
+	return { cells, Wf, Hf };
+}
+
+/**
+ * Draw the features into a W x H grid (null = leave the skin alone).
+ * Coordinates: x from the VIEWER's left, y from the top.
+ */
+function renderFaceFeatures(W, H, o) {
+	const grid = [];
+	for (let y = 0; y < H; y++) grid.push(new Array(W).fill(null));
+	const put = (x, y, c, mix) => {
+		x = Math.round(x); y = Math.round(y);
+		if (x < 0 || y < 0 || x >= W || y >= H || !c) return;
+		grid[y][x] = mix != null ? { c, mix } : { c };
+	};
+	const style = FACE_STYLES.includes(o.style) ? o.style : 'anime';
+	const expr = String(o.expression || 'neutral').toLowerCase();
+	const eyeC = hexToRgb(o.eye_color || '#3d5fd0');
+	const base = { rgb: eyeC };
+	const flat = { hue_shift: 10 };
+	const irisDark = toneRgb(base, -0.55, flat), irisLight = toneRgb({ rgb: eyeC }, 0.4, flat);
+	const lash = hexToRgb(o.lash_color || '#1c141c');
+	const white = hexToRgb(o.sclera_color || '#f6f2ee');
+	const skin = o.skin_rgb || [240, 200, 180];
+	const skinShadow = toneRgb({ rgb: skin }, -0.35, { hue_shift: 10, shadow_hue: 350 });
+
+	// --- layout -------------------------------------------------------------
+	const big = style === 'anime' || style === 'chibi';
+	let ew = o.eye_width != null ? o.eye_width | 0 : Math.max(style === 'beady' ? 1 : 2, Math.round(W * (big ? (style === 'chibi' ? 0.3 : 0.26) : style === 'cartoon' ? 0.22 : 0.2)));
+	let eh = o.eye_height != null ? o.eye_height | 0 : Math.max(1, Math.round(H * (big ? (style === 'chibi' ? 0.42 : 0.37) : style === 'cartoon' ? 0.25 : style === 'minecraft' ? 0.125 : 0.15)));
+	if (style === 'minecraft') eh = Math.max(1, eh);
+	const margin = o.eye_margin != null ? o.eye_margin | 0 : Math.max(1, Math.round(W * 0.125));
+	let gap = o.eye_gap != null ? o.eye_gap | 0 : Math.max(1, W - 2 * ew - 2 * margin);
+	if (2 * ew + gap > W) gap = Math.max(1, W - 2 * ew);
+	const left0 = Math.round((W - (2 * ew + gap)) / 2);
+	const eyeY = o.eye_y != null ? o.eye_y | 0 : Math.round(H * (big ? 0.5 : 0.5)) - Math.floor(eh / 2) + (style === 'minecraft' ? 0 : 0);
+	const eyes = [
+		{ x: left0, outerLeft: true },              // viewer's left = the model's RIGHT eye
+		{ x: left0 + ew + gap, outerLeft: false },
+	];
+	const closed = expr === 'happy' || expr === 'closed' || expr === 'sleepy';
+
+	// --- eyes -----------------------------------------------------------------
+	eyes.forEach((e) => {
+		const X = (dx) => (e.outerLeft ? e.x + dx : e.x + ew - 1 - dx); // dx 0 = OUTER side
+		if (closed) {
+			// ^ ^ for happy, a flat lash line for closed/sleepy
+			for (let dx = 0; dx < ew; dx++) {
+				const lift = expr === 'happy' && ew >= 3 && dx > 0 && dx < ew - 1 ? -1 : 0;
+				put(X(dx), eyeY + Math.floor(eh / 2) + lift, lash);
+			}
+			return;
+		}
+		if (style === 'minecraft') {
+			for (let dy = 0; dy < eh; dy++) {
+				for (let dx = 0; dx < ew; dx++) put(X(dx), eyeY + dy, dx < ew / 2 ? white : eyeC);
+			}
+			return;
+		}
+		if (style === 'beady') {
+			for (let dy = 0; dy < eh; dy++) for (let dx = 0; dx < ew; dx++) put(X(dx), eyeY + dy, lash);
+			if (ew >= 2 || eh >= 2) put(X(ew - 1), eyeY, white);
+			return;
+		}
+		if (style === 'cartoon') {
+			for (let dy = 0; dy < eh; dy++) for (let dx = 0; dx < ew; dx++) put(X(dx), eyeY + dy, white);
+			const pw = Math.max(1, Math.round(ew / 2)), ph = Math.max(1, Math.round(eh * 0.6));
+			for (let dy = 0; dy < ph; dy++) for (let dx = 0; dx < pw; dx++) put(X(ew - pw + dx), eyeY + eh - ph + dy, lash);
+			if (pw >= 2 && ph >= 2) put(X(ew - pw), eyeY + eh - ph, white);
+			return;
+		}
+		// anime / chibi
+		const lowered = expr === 'shy' || expr === 'sad' ? 1 : 0;
+		const top = eyeY + lowered;
+		const h = Math.max(2, eh - lowered);
+		// upper lash: full width, thick at the outer corner, a wing past it when there is room
+		for (let dx = 0; dx < ew; dx++) put(X(dx), top, lash);
+		if (ew >= 3 && h >= 4) put(X(0), top + 1, lash);
+		if (ew >= 4 && margin >= 1) put(X(-1), top, lash);
+		// iris body with a vertical gradient: dark under the lash, bright at the bottom
+		const scleraCol = ew >= 4;
+		for (let dy = 1; dy < h; dy++) {
+			const t = (dy - 1) / Math.max(1, h - 2);
+			const c = t < 0.34 ? irisDark : t < 0.75 ? eyeC : irisLight;
+			for (let dx = 0; dx < ew; dx++) {
+				if (ew >= 3 && h >= 4 && dx === 0 && dy === 1) continue; // lash corner already
+				if (scleraCol && dx === ew - 1) { put(X(dx), top + dy, white); continue; }
+				put(X(dx), top + dy, c);
+			}
+		}
+		// pupil
+		if (ew >= 3 && h >= 4) {
+			const pc = Math.floor((ew - (scleraCol ? 1 : 0)) / 2);
+			for (let dy = 1; dy < Math.min(h - 1, 3); dy++) put(X(pc), top + dy, lash);
+		}
+		// highlights: a bright catchlight up top, a small one low on the opposite side
+		if (o.highlight !== false) {
+			const hx = ew >= 3 ? 1 : 0;
+			put(X(hx), top + 1, white);
+			if (ew >= 4 && h >= 5) put(X(ew - 2), top + h - 2, white, 0.65);
+		}
+		// lower lash hint
+		if (h >= 5 && ew >= 3) put(X(0), top + h - 1, skinShadow);
+	});
+
+	// --- brows ----------------------------------------------------------------
+	if (o.brows !== false && eyeY >= 2) {
+		const bc = o.brow_color ? hexToRgb(o.brow_color) : toneRgb({ rgb: lash }, 0.25, flat);
+		const by = Math.max(0, eyeY - 2 + (o.brow_offset | 0));
+		eyes.forEach((e) => {
+			const X = (dx) => (e.outerLeft ? e.x + dx : e.x + ew - 1 - dx);
+			for (let dx = 0; dx < ew; dx++) {
+				let dy = 0;
+				const inner = dx >= ew - Math.max(1, Math.floor(ew / 2));
+				if (expr === 'angry' && inner) dy = 1;
+				if ((expr === 'sad' || expr === 'shy' || expr === 'worried') && inner) dy = -1;
+				if (expr === 'surprised') dy = -1;
+				put(X(dx), by + dy, bc);
+			}
+		});
+	}
+
+	// --- blush ------------------------------------------------------------------
+	const blushOn = o.blush != null ? !!o.blush : (expr === 'shy');
+	if (blushOn) {
+		const bl = hexToRgb(typeof o.blush === 'string' ? o.blush : '#ff7f98');
+		const by = eyeY + eh + (big ? 0 : 1);
+		eyes.forEach((e) => {
+			const X = (dx) => (e.outerLeft ? e.x + dx : e.x + ew - 1 - dx);
+			const bw = Math.max(1, Math.min(ew, 3));
+			const rows = H >= 12 ? 2 : 1;
+			for (let r = 0; r < rows; r++) {
+				for (let dx = 0; dx < bw; dx++) {
+					// anime blush hatch: diagonal strokes over a soft wash
+					const stroke = big && W >= 12 && ((dx + r) % 2 === 0);
+					put(X(dx), by + r, bl, stroke ? 0.75 : 0.42);
+				}
+			}
+		});
+	}
+
+	// --- nose -------------------------------------------------------------------
+	if (o.nose === 'dot' || (o.nose == null && style === 'cartoon')) {
+		put(Math.floor(W / 2) - (W % 2 === 0 ? 1 : 0), Math.min(H - 2, eyeY + eh + 1), skinShadow);
+	}
+
+	// --- mouth ------------------------------------------------------------------
+	let mouth = o.mouth || (expr === 'happy' ? 'smile' : expr === 'sad' ? 'frown' : expr === 'surprised' ? 'open' : 'small');
+	if (mouth !== 'none') {
+		const my = o.mouth_y != null ? o.mouth_y | 0 : Math.min(H - 1, Math.round(H * (big ? 0.84 : 0.8)));
+		const mc = o.mouth_color ? hexToRgb(o.mouth_color) : mixRgb(skinShadow, [150, 60, 70], 0.45);
+		const cx = W / 2;
+		const mw = mouth === 'small' ? (W >= 12 ? 2 : 1) : Math.max(2, Math.round(W * 0.25));
+		const x0 = Math.round(cx - mw / 2);
+		if (mouth === 'small' || mouth === 'line') {
+			for (let dx = 0; dx < mw; dx++) put(x0 + dx, my, mc);
+		} else if (mouth === 'smile') {
+			for (let dx = 0; dx < mw; dx++) put(x0 + dx, my, mc);
+			put(x0 - 1, my - 1, mc); put(x0 + mw, my - 1, mc);
+		} else if (mouth === 'frown') {
+			for (let dx = 0; dx < mw; dx++) put(x0 + dx, my - 1, mc);
+			put(x0 - 1, my, mc); put(x0 + mw, my, mc);
+		} else if (mouth === 'open') {
+			const ow = Math.max(2, mw - (W >= 12 ? 0 : 1));
+			const ox = Math.round(cx - ow / 2);
+			for (let dx = 0; dx < ow; dx++) { put(ox + dx, my - 1, [70, 20, 30]); put(ox + dx, my, [220, 110, 120]); }
+		} else if (mouth === 'cat') {
+			put(Math.floor(cx) - 2, my - 1, mc); put(Math.floor(cx) - 1, my, mc); put(Math.floor(cx), my - 1, mc);
+			put(Math.floor(cx) + 1, my, mc); put(Math.floor(cx) + 2, my - 1, mc);
+		}
+	}
+	return { grid, layout: { eye_width: ew, eye_height: eh, eye_gap: gap, eye_top: eyeY, face_px: [W, H], style, expression: expr } };
+}
+
+// ---------------------------------------------------------------------------
+// ROUND SHAPES, MECHANISMS, CLOTH AND HAIR
+//
+// Cylinders, gears, pipes, flared skirts and anime hair are the shapes an AI
+// most often fakes with one box (a "wheel" that is a square, a "skirt" that is
+// a slab, "hair" that is a helmet). Each builder below turns a few intuitive
+// numbers into correctly rotated cubes, pivots placed for animation, and
+// names that the paint engine's material rules recognise.
+// ---------------------------------------------------------------------------
+
+function axisName(a) {
+	const s = String(a || 'y').toLowerCase().replace(/^[+-]/, '');
+	if (s !== 'x' && s !== 'y' && s !== 'z') throw new Error(`axis must be "x", "y" or "z", got "${a}".`);
+	return s;
+}
+/** In-plane basis of a ring around `axis`: angle 0 points along U, 90 along V. */
+function ringBasis(axis) {
+	if (axis === 'x') return { U: [0, 0, 1], V: [0, 1, 0] };
+	if (axis === 'z') return { U: [1, 0, 0], V: [0, 1, 0] };
+	return { U: [1, 0, 0], V: [0, 0, 1] };
+}
+/** Single-axis rotation that turns the ring's U direction toward angle θ. */
+function ringRotation(axis, thetaDeg) {
+	let a = axis === 'z' ? thetaDeg : -thetaDeg;
+	a = ((a + 180) % 360 + 360) % 360 - 180;
+	const r = [0, 0, 0];
+	r[AXIS_INDEX[axis]] = R3(a);
+	return r;
+}
+/** Box size with `radial` along U, `tangent` along V, `along` the axis. */
+function ringBoxSize(axis, radial, tangent, along) {
+	if (axis === 'x') return [along, tangent, radial];
+	if (axis === 'z') return [radial, tangent, along];
+	return [radial, along, tangent];
+}
+function boxAround(c, size) {
+	return {
+		from: [c[0] - size[0] / 2, c[1] - size[1] / 2, c[2] - size[2] / 2].map(R3),
+		to: [c[0] + size[0] / 2, c[1] + size[1] / 2, c[2] + size[2] / 2].map(R3),
+	};
+}
+
+/** Rodrigues rotation matrix about a unit axis. */
+function matAxisAngle(ax, deg) {
+	const t = deg * Math.PI / 180, c = Math.cos(t), s = Math.sin(t), C = 1 - c;
+	const [x, y, z] = vecNorm(ax);
+	return [
+		[c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+		[y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+		[z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+	];
+}
+/** Rotation taking +Y onto unit vector d. */
+function matYTo(d) {
+	const n = vecNorm(d);
+	const c = n[1];
+	if (c > 0.999999) return IDENTITY3;
+	if (c < -0.999999) return eulerToMat([180, 0, 0]);
+	return matAxisAngle(vecCross([0, 1, 0], n), Math.acos(c) * 180 / Math.PI);
+}
+function cleanEuler(m) {
+	return matToEuler(m).map((v) => (Math.abs(v) < 1e-3 ? 0 : R3(v)));
+}
+
+/**
+ * A regular n-gon (n even) as the union of n/2 rectangular BANDS: each band
+ * runs across the polygon between two opposite sides (length 2*apothem) and is
+ * one side wide, turned 360/n apart. Their union is exactly the polygon — the
+ * corners of every band are polygon vertices, so nothing pokes out (rotated
+ * squares would make a star). A band at angle t and one at t+90 with its
+ * dimensions swapped are the same box, so every rotation is folded into
+ * (-45, 45] — cleaner numbers, and Java-block friendly for n = 8 / 16.
+ */
+function ngonBands(n, R, phase) {
+	const a = R * Math.cos(Math.PI / n), side = 2 * R * Math.sin(Math.PI / n);
+	const out = [];
+	for (let i = 0; i < n / 2; i++) {
+		let t = (((phase || 0) + i * 360 / n) % 180 + 180) % 180;
+		let radial = 2 * a, tangent = side;
+		if (t > 45 + 1e-6 && t <= 135 + 1e-6) { t -= 90; radial = side; tangent = 2 * a; }
+		else if (t > 135 + 1e-6) t -= 180;
+		out.push({ angle: R3(t), radial, tangent });
+	}
+	return out;
+}
+
+/**
+ * Cubes for a cylinder along a world axis. Solid: n/2 bands (see ngonBands),
+ * each 0.05 shorter than the last so the end caps never share a plane. Hollow:
+ * a ring of `sides` slabs whose outer faces meet.
+ */
+function cylinderCubes(o) {
+	const axis = o.axis;
+	const ai = AXIS_INDEX[axis];
+	const c = o.center;
+	const out = [];
+	if (o.inner_radius > 0) {
+		const n = o.sides;
+		const t = o.radius - o.inner_radius;
+		const mid = (o.radius + o.inner_radius) / 2;
+		const width = 2 * o.radius * Math.tan(Math.PI / n) * 1.01;
+		const { U } = ringBasis(axis);
+		for (let i = 0; i < n; i++) {
+			const th = (o.phase || 0) + i * 360 / n;
+			const pos = [c[0] + U[0] * mid, c[1] + U[1] * mid, c[2] + U[2] * mid];
+			const b = boxAround(pos, ringBoxSize(axis, t, width, o.length + (i % 2 ? 0.04 : 0)));
+			out.push(Object.assign(b, { name: `${o.name}_${i + 1}`, origin: c.map(R3), rotation: ringRotation(axis, th) }));
+		}
+		return out;
+	}
+	const n = Math.max(4, Math.round(o.sides / 2) * 2);
+	const bands = n === 4 ? [{ angle: R3(o.phase || 0), radial: 2 * o.radius * Math.SQRT1_2, tangent: 2 * o.radius * Math.SQRT1_2 }] : ngonBands(n, o.radius, o.phase);
+	bands.forEach((b, i) => {
+		const size = ringBoxSize(axis, b.radial, b.tangent, Math.max(0.05, o.length - i * 0.05));
+		out.push(Object.assign(boxAround(c, size), { name: bands.length > 1 ? `${o.name}_${i + 1}` : o.name, origin: c.map(R3), rotation: ringRotation(axis, b.angle) }));
+	});
+	return out;
+}
+
+/** Where gears live between calls, so a second gear can mesh with the first. */
+function gearRegistry() {
+	if (!Project.mcp_gears) Project.mcp_gears = {};
+	return Project.mcp_gears;
+}
+
+/** Make a bone (or reuse an existing one of that name) for a generated part. */
+function makeBone(name, origin, parent, rotation) {
+	const g = new Group({ name, origin: origin.map(R3), rotation: rotation || [0, 0, 0] }).init();
+	g.addTo(parent || 'root');
+	return g;
+}
+
+function specsToCubes(parent, specs, inflate) {
+	return specs.map((s) => createCubeIn(parent, Object.assign({ inflate }, s)));
+}
+
+// ---- hair -------------------------------------------------------------------
+const HAIR_STYLES = {
+	short:      { back: 0, sides: 0.25, bangs: 'swept', sidelocks: false, tails: [] },
+	bob:        { back: 1, sides: -0.05, bangs: 'straight', sidelocks: true, tails: [] },
+	long:       { back: 14, sides: -0.4, bangs: 'parted', sidelocks: true, tails: [] },
+	ponytail:   { back: 0, sides: 0.2, bangs: 'swept', sidelocks: true, tails: [{ side: 'back', height: 'high', direction: 'down' }] },
+	twin_tails: { back: 2, sides: 0.05, bangs: 'parted', sidelocks: true, tails: [{ side: 'right', height: 'high', direction: 'down' }, { side: 'left', height: 'high', direction: 'down' }] },
+	pigtails:   { back: 0, sides: 0.1, bangs: 'straight', sidelocks: true, tails: [{ side: 'right', height: 'low', direction: 'down' }, { side: 'left', height: 'low', direction: 'down' }] },
+	spiky:      { back: 0, sides: 0.3, bangs: 'spiky', sidelocks: false, tails: [], spikes: 7 },
+	bun:        { back: 0, sides: 0.25, bangs: 'swept', sidelocks: true, tails: [], bun: true },
+};
+
+// ---------------------------------------------------------------------------
+// PALETTES — read the colour scheme out of a reference / concept (or build one
+// from a text brief) as named colour families, each with a 5-step hue-shifted
+// ramp. The palette is stored on the project, so texturing rules can say
+// color:"$hair" or color:"$hair.dark" instead of guessing hex codes.
+// ---------------------------------------------------------------------------
+
+function srgbToLin(c) { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+function rgbToLab(rgb) {
+	const r = srgbToLin(rgb[0]), g = srgbToLin(rgb[1]), b = srgbToLin(rgb[2]);
+	let x = (r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047;
+	let y = r * 0.2126 + g * 0.7152 + b * 0.0722;
+	let z = (r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883;
+	const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+	x = f(x); y = f(y); z = f(z);
+	return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
+}
+function labDist(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
+
+/** A plain-English name for a colour: "dark navy", "pale pink", "skin", "near-black". */
+function colorName(rgb) {
+	const { h, s, l } = rgbToHsl(rgb[0], rgb[1], rgb[2]);
+	if (l < 0.1) return 'near-black';
+	if (l > 0.93 && s < 0.35) return 'white';
+	if (s < 0.12) return l < 0.3 ? 'charcoal' : l < 0.55 ? 'grey' : l < 0.8 ? 'light grey' : 'off-white';
+	if (h >= 8 && h <= 40 && s >= 0.2 && s <= 0.75 && l >= 0.6 && l <= 0.9) return 'skin';
+	const names = [
+		[12, 'red'], [25, 'red-orange'], [40, 'orange'], [52, 'amber'], [64, 'yellow'], [80, 'lime'],
+		[150, 'green'], [175, 'teal'], [195, 'cyan'], [215, 'sky blue'], [240, 'blue'], [258, 'indigo'],
+		[280, 'violet'], [305, 'purple'], [330, 'magenta'], [347, 'pink'], [361, 'red'],
+	];
+	let base = names.find(([lim]) => h < lim)[1];
+	if (base === 'orange' && l < 0.42) base = 'brown';
+	if (base === 'red-orange' && l < 0.38) base = 'brown';
+	if (base === 'amber' && l < 0.4) base = 'olive';
+	if (base === 'blue' && l < 0.3) base = 'navy';
+	if ((base === 'pink' || base === 'magenta') && l < 0.35) base = 'wine';
+	if (base === 'red' && l > 0.72) base = 'pink';
+	const mod = l < 0.25 ? 'dark ' : l < 0.4 ? 'deep ' : l > 0.8 ? 'pale ' : l > 0.66 ? 'light ' : '';
+	const dull = s < 0.3 && base !== 'brown' ? 'muted ' : '';
+	return (mod + dull + base).trim();
+}
+
+/** Best-guess material for a colour family when nothing else says. */
+function materialHintFor(rgb, name) {
+	if (name === 'skin') return 'skin';
+	const { s, l } = rgbToHsl(rgb[0], rgb[1], rgb[2]);
+	if (/grey|white|charcoal/.test(name) && l > 0.45 && s < 0.12) return 'metal or cloth';
+	if (/amber|yellow/.test(name) && s > 0.45) return 'gold or cloth';
+	if (/brown/.test(name)) return 'wood or leather';
+	return 'cloth';
+}
+
+/** A 5-step ramp (deep shadow .. highlight) around a base colour, same maths as the paint engine. */
+function rampFor(rgb, opts) {
+	const base = { rgb };
+	const mat = Object.assign({ hue_shift: 12 }, opts || {});
+	return [-0.75, -0.4, 0, 0.45, 0.85].map((v) => rgbToHex(v === 0 ? rgb : toneRgb(base, v, mat)));
+}
+
+/** Deterministic k-means (k-means++ seeding on a fixed PRNG) in Lab space. */
+function kmeansLab(points, k, iters) {
+	if (!points.length) return [];
+	k = Math.min(k, points.length);
+	const rnd = makeRandom(4242);
+	const cents = [points[Math.floor(rnd() * points.length)].lab.slice()];
+	const d2 = new Float64Array(points.length);
+	while (cents.length < k) {
+		let sum = 0;
+		points.forEach((p, i) => {
+			let best = Infinity;
+			for (const c of cents) best = Math.min(best, (p.lab[0] - c[0]) ** 2 + (p.lab[1] - c[1]) ** 2 + (p.lab[2] - c[2]) ** 2);
+			d2[i] = best * p.w; sum += d2[i];
+		});
+		if (sum <= 0) break;
+		let r = rnd() * sum, idx = 0;
+		for (; idx < points.length - 1; idx++) { r -= d2[idx]; if (r <= 0) break; }
+		cents.push(points[idx].lab.slice());
+	}
+	const assign = new Int32Array(points.length);
+	for (let it = 0; it < (iters || 12); it++) {
+		const sums = cents.map(() => [0, 0, 0, 0, 0, 0, 0]);
+		points.forEach((p, i) => {
+			let best = 0, bd = Infinity;
+			cents.forEach((c, j) => {
+				const dd = (p.lab[0] - c[0]) ** 2 + (p.lab[1] - c[1]) ** 2 + (p.lab[2] - c[2]) ** 2;
+				if (dd < bd) { bd = dd; best = j; }
+			});
+			assign[i] = best;
+			const s = sums[best];
+			s[0] += p.lab[0] * p.w; s[1] += p.lab[1] * p.w; s[2] += p.lab[2] * p.w;
+			s[3] += p.rgb[0] * p.w; s[4] += p.rgb[1] * p.w; s[5] += p.rgb[2] * p.w; s[6] += p.w;
+		});
+		cents.forEach((c, j) => { const s = sums[j]; if (s[6]) { c[0] = s[0] / s[6]; c[1] = s[1] / s[6]; c[2] = s[2] / s[6]; c.rgb = [s[3] / s[6], s[4] / s[6], s[5] / s[6]]; c.w = s[6]; } else c.w = 0; });
+	}
+	const total = points.reduce((a, p) => a + p.w, 0) || 1;
+	return cents.filter((c) => c.w > 0).map((c) => ({ lab: [c[0], c[1], c[2]], rgb: c.rgb, share: c.w / total }));
+}
+
+/**
+ * Pixels of an image worth clustering: background (the colour that owns the
+ * border) and transparency removed, the centre weighted a little higher.
+ */
+function paletteSamples(img, rect, keepBackground) {
+	const { width: W, height: H, data: d } = img;
+	const [rx0, ry0, rx1, ry1] = rect || [0, 0, W, H];
+	let bg = null;
+	if (!keepBackground && !rect) {
+		const border = [];
+		const stepB = Math.max(1, Math.floor((W + H) / 200));
+		for (let x = 0; x < W; x += stepB) { border.push([x, 0]); border.push([x, H - 1]); }
+		for (let y = 0; y < H; y += stepB) { border.push([0, y]); border.push([W - 1, y]); }
+		const labs = border.map(([x, y]) => { const o = (y * W + x) * 4; return d[o + 3] < 128 ? null : rgbToLab([d[o], d[o + 1], d[o + 2]]); }).filter(Boolean);
+		if (labs.length) {
+			const c = kmeansLab(labs.map((lab) => ({ lab, rgb: [0, 0, 0], w: 1 })), 2, 6).sort((a, b) => b.share - a.share)[0];
+			if (c && c.share > 0.55) bg = c.lab;
+		}
+	}
+	const pts = [];
+	const area = Math.max(1, (rx1 - rx0) * (ry1 - ry0));
+	const step = Math.max(1, Math.floor(Math.sqrt(area / 9000)));
+	let dropped = 0;
+	for (let y = Math.max(0, ry0); y < Math.min(H, ry1); y += step) {
+		for (let x = Math.max(0, rx0); x < Math.min(W, rx1); x += step) {
+			const o = (y * W + x) * 4;
+			if (d[o + 3] < 128) { dropped++; continue; }
+			const rgb = [d[o], d[o + 1], d[o + 2]];
+			const lab = rgbToLab(rgb);
+			if (bg && labDist(lab, bg) < 9) { dropped++; continue; }
+			const cx = (x - W / 2) / W, cy = (y - H / 2) / H;
+			pts.push({ rgb, lab, w: 1 + 0.6 * Math.max(0, 1 - 4 * (cx * cx + cy * cy)) });
+		}
+	}
+	return { points: pts, background: bg ? rgbToHex(labToRgbApprox(bg, d, W, H, rect)) : null, dropped };
+}
+// The background colour itself, for the report (the Lab centre is close enough to the border pixel).
+function labToRgbApprox(lab, d, W, H) {
+	let best = null, bd = Infinity;
+	for (let x = 0; x < W; x += Math.max(1, W >> 5)) {
+		const o = x * 4;
+		const c = [d[o], d[o + 1], d[o + 2]];
+		const dd = labDist(rgbToLab(c), lab);
+		if (dd < bd) { bd = dd; best = c; }
+	}
+	return best || [255, 255, 255];
+}
+
+/**
+ * Turn raw clusters into colour FAMILIES: clusters of the same hue that differ
+ * mostly in lightness are one material in light and shadow (hair, skirt...),
+ * so they become one family whose observed shades seed its ramp.
+ */
+function familiesFromClusters(clusters, maxFamilies) {
+	const cl = clusters.map((c) => Object.assign({}, c, { hsl: rgbToHsl(c.rgb[0], c.rgb[1], c.rgb[2]) }));
+	cl.sort((a, b) => b.share - a.share);
+	const fams = [];
+	for (const c of cl) {
+		const chroma = Math.hypot(c.lab[1], c.lab[2]);
+		let home = null;
+		for (const f of fams) {
+			const fc = Math.hypot(f.lab[1], f.lab[2]);
+			if (chroma < 12 && fc < 12) { if (Math.abs(c.lab[0] - f.lab[0]) < 18) { home = f; break; } continue; }
+			if (chroma < 12 || fc < 12) continue;
+			const hueA = Math.atan2(c.lab[2], c.lab[1]), hueB = Math.atan2(f.lab[2], f.lab[1]);
+			let dh = Math.abs(hueA - hueB) * 180 / Math.PI;
+			if (dh > 180) dh = 360 - dh;
+			if (dh < 16 && Math.abs(c.lab[0] - f.lab[0]) < 42 && chroma / fc > 0.45 && chroma / fc < 2.2) { home = f; break; }
+		}
+		if (home) { home.members.push(c); home.share += c.share; }
+		else fams.push({ lab: c.lab, rgb: c.rgb, share: c.share, members: [c] });
+	}
+	return fams.sort((a, b) => b.share - a.share).slice(0, maxFamilies || 10).map((f) => {
+		const base = f.members.slice().sort((a, b) => b.share - a.share)[0];
+		const shades = f.members.slice().sort((a, b) => a.lab[0] - b.lab[0]).map((m) => rgbToHex(m.rgb));
+		return { rgb: base.rgb, share: f.share, observed: shades };
+	});
+}
+
+/** Harmony generator for text-only briefs: hues for a scheme around a base hue. */
+const PALETTE_SCHEMES = {
+	monochrome: [0],
+	analogous: [0, -30, 30],
+	complementary: [0, 180],
+	split: [0, 150, 210],
+	triadic: [0, 120, 240],
+	tetradic: [0, 90, 180, 270],
+};
+const PALETTE_MOODS = {
+	neutral: { s: 0.5, l: 0.5 }, vibrant: { s: 0.78, l: 0.52 }, pastel: { s: 0.55, l: 0.78 }, muted: { s: 0.28, l: 0.5 },
+	dark: { s: 0.45, l: 0.3 }, earthy: { s: 0.38, l: 0.42, warm: 1 }, neon: { s: 0.95, l: 0.55 }, warm: { s: 0.6, l: 0.52, warm: 1 },
+	cool: { s: 0.5, l: 0.5, cool: 1 }, grim: { s: 0.18, l: 0.34 }, cute: { s: 0.6, l: 0.74 }, royal: { s: 0.6, l: 0.4 },
+};
+
+/** What a palette key most likely is, from its name ("skin", "hair_ribbon", "buckle"...). */
+function materialHintFromKey(key) {
+	const k = String(key || '').toLowerCase();
+	if (/skin|face|flesh|hand|body/.test(k)) return 'skin';
+	if (/hair|fur|mane/.test(k)) return 'hair';
+	if (/metal|steel|iron|buckle|ring|chain|blade|gear|chrome/.test(k)) return 'metal';
+	if (/gold|brass|bronze|copper/.test(k)) return 'gold';
+	if (/leather|belt|boot|strap|choker|collar/.test(k)) return 'leather';
+	if (/eye|iris|pupil/.test(k)) return 'eye';
+	if (/wood|bark|plank/.test(k)) return 'wood';
+	if (/stone|rock|brick/.test(k)) return 'stone';
+	if (/glow|light|lamp|neon|crystal|gem/.test(k)) return 'emissive or gem';
+	return null;
+}
+
+function buildPaletteEntry(rgb, extra) {
+	extra = extra || {};
+	const name = colorName(rgb);
+	const hint = extra.material_hint || materialHintFromKey(extra.key) || materialHintFor(rgb, name);
+	const isSkin = name === 'skin' || hint === 'skin';
+	const mat = isSkin ? { hue_shift: 7, shadow_hue: 345, light_hue: 40, shadow_sat: 0.05 } : {};
+	return Object.assign({ name, base: rgbToHex(rgb), ramp: rampFor(rgb, mat) }, extra, { material_hint: hint });
+}
+
+/** Store {key: entry} on the project for "$key" colour references. */
+function storePalette(entries, name) {
+	if (!Project) return;
+	const map = {};
+	entries.forEach((e, i) => { map[e.key || `c${i + 1}`] = { base: e.base, ramp: e.ramp }; });
+	Project.mcp_palette = Object.assign(Project.mcp_palette || {}, map);
+	Project.mcp_palette_name = name || Project.mcp_palette_name || 'palette';
+}
+
+const RAMP_STEPS = { deep: 0, darkest: 0, shadow: 1, dark: 1, base: 2, mid: 2, light: 3, highlight: 4, lightest: 4 };
+/** "$hair" / "$hair.dark" / "palette:hair.light" -> rgb, or null. */
+function paletteLookup(str) {
+	const m = /^(?:\$|palette:)([a-z0-9_\- ]+?)(?:\.([a-z]+))?$/i.exec(String(str).trim());
+	if (!m || typeof Project === 'undefined' || !Project || !Project.mcp_palette) return null;
+	const e = Project.mcp_palette[m[1]] || Project.mcp_palette[m[1].toLowerCase()];
+	if (!e) return null;
+	const step = m[2] ? RAMP_STEPS[m[2].toLowerCase()] : 2;
+	const hex = step != null && e.ramp ? e.ramp[step] : e.base;
+	return hexToRgbPlain(hex);
+}
+function hexToRgbPlain(h) {
+	h = String(h).replace('#', '');
+	return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+
+/** Draw the palette as a labelled swatch card so the agent (and user) can SEE it. */
+function renderPaletteCard(entries, title) {
+	try {
+		const rowH = 34, W = 560, pad = 10;
+		const c = document.createElement('canvas');
+		c.width = W; c.height = pad * 2 + 26 + entries.length * rowH;
+		const x = c.getContext('2d');
+		x.fillStyle = '#16181d'; x.fillRect(0, 0, c.width, c.height);
+		x.fillStyle = '#e8ecf3'; x.font = 'bold 14px sans-serif'; x.textBaseline = 'middle';
+		x.fillText(String(title || 'palette').slice(0, 60), pad, pad + 10);
+		entries.forEach((e, i) => {
+			const y = pad + 26 + i * rowH;
+			e.ramp.forEach((hex, k) => { x.fillStyle = hex; x.fillRect(pad + k * 34, y, 34, rowH - 6); });
+			x.strokeStyle = '#ffffff'; x.lineWidth = 2; x.strokeRect(pad + 2 * 34 + 1, y + 1, 32, rowH - 8);
+			x.fillStyle = '#e8ecf3'; x.font = 'bold 12px monospace';
+			x.fillText(`${e.key ? '$' + e.key : e.name}`, pad + 5 * 34 + 12, y + 9);
+			x.fillStyle = '#9aa3b2'; x.font = '11px monospace';
+			const share = e.share != null ? `  ${Math.round(e.share * 100)}%` : '';
+			x.fillText(`${e.base}  ${e.name}${share}  -> ${e.material_hint}`.slice(0, 58), pad + 5 * 34 + 12, y + 22);
+		});
+		return c.toDataURL('image/png');
+	} catch (e) { return null; }
+}
+
+/** Quick 6-colour summary of a reference, cached on the entry (used by load/get_reference). */
+async function quickReferencePalette(entry) {
+	if (entry.quick_palette) return entry.quick_palette;
+	try {
+		const img = await imageDataFromSource(entry.data_url, 220);
+		const s = paletteSamples(img, null, false);
+		const fams = familiesFromClusters(kmeansLab(s.points, 10, 10), 6);
+		entry.quick_palette = fams.filter((f) => f.share > 0.015).map((f) => `${rgbToHex(f.rgb)} ${colorName(f.rgb)} ${Math.round(f.share * 100)}%`);
+	} catch (e) { entry.quick_palette = []; }
+	return entry.quick_palette;
+}
+
+/** "Hair colour!" -> "hair_colour" — palette keys are plain identifiers. */
+function slugKey(s) {
+	return String(s || 'color').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'color';
+}
+
+// ---------------------------------------------------------------------------
+// Cube placement: center/size, attach-to-a-face and mirror
+//
+// Hand-computing [from,to] is where most placement bugs come from: a belt that
+// floats 0.3 off the waist, a buckle that sinks inside the belt, an eye behind
+// the face, a right pauldron built at a different height than the left one.
+// These resolve the shapes an AI can describe ("2x2x0.5 on the front of the
+// belt, centred, sticking out") into exact coordinates.
+// ---------------------------------------------------------------------------
+
+/** In-plane axes [a, b] used by attach.at for each face: north/south [x,y], east/west [z,y], up/down [x,z]. */
+const ATTACH_AXES = { north: [0, 1], south: [0, 1], east: [2, 1], west: [2, 1], up: [0, 2], down: [0, 2] };
+
+/**
+ * Resolve one add_cube(s) spec into concrete {from,to,origin,rotation,parent}.
+ * Accepts the classic from/to, or center+size, or attach:{to, face, at, embed}
+ * + size. `created` maps names made earlier in the same batch.
+ */
+function resolveCubePlacement(spec, created) {
+	const out = Object.assign({}, spec);
+	const lookupCube = (ref) => (created && created[ref]) || findElement(ref);
+	if (spec.attach) {
+		const at = maybeParse(spec.attach);
+		const ref = at.to || at.cube || at.target;
+		const target = lookupCube(ref);
+		if (!target || !(target instanceof Cube)) {
+			throw new Error(`attach.to: cube "${ref}" not found. attach needs the NAME of an existing cube (or one created earlier in this call).`);
+		}
+		const size = num3(maybeParse(spec.size), [0, 0, 0]);
+		if (!spec.size || size.some((v) => !(v > 0))) {
+			throw new Error(`"${spec.name || 'cube'}": attach needs size:[w,h,d] (in the target cube's axes), all > 0.`);
+		}
+		const face = normalizeFaceName(at.face || 'front');
+		const g = FACE_GEOM[face];
+		const box = cubeLocalBox(target);
+		const ax = ATTACH_AXES[face];
+		const pos = numN(maybeParse(at.at || at.position || [0, 0]), 2, [0, 0]);
+		const embed = numOr(at.embed, 0);
+		const c = [0, 0, 0];
+		for (let k = 0; k < 2; k++) {
+			const i = ax[k];
+			const mid = (box.min[i] + box.max[i]) / 2;
+			const halfRoom = Math.max(0, (box.max[i] - box.min[i]) / 2 - size[i] / 2);
+			const v = Math.max(-1.5, Math.min(1.5, pos[k]));
+			c[i] = mid + v * halfRoom;
+		}
+		const sign = g.side ? 1 : -1;
+		const plane = g.side ? box.max[g.axis] : box.min[g.axis];
+		c[g.axis] = plane + sign * (size[g.axis] / 2 - embed);
+		const offset = num3(maybeParse(at.offset), [0, 0, 0]);
+		for (let k = 0; k < 3; k++) c[k] += offset[k];
+
+		// Carry the target's world placement into the parent this cube goes into.
+		const parentRef = spec.parent !== undefined ? spec.parent : (target.parent && target.parent !== 'root' ? target.parent : null);
+		const parent = parentRef && typeof parentRef === 'object'
+			? parentRef
+			: (parentRef ? ((created && created[parentRef]) || findGroup(parentRef)) : null);
+		if (parentRef && !parent) throw new Error('Parent group not found: ' + parentRef);
+		const T = nodeWorld(target);
+		const P = parent ? nodeWorld(parent) : { R: IDENTITY3, t: [0, 0, 0] };
+		const PinvR = matTranspose(P.R);
+		const w = xformPoint(T, c);
+		const local = matApply(PinvR, [w[0] - P.t[0], w[1] - P.t[1], w[2] - P.t[2]]);
+		const extraRot = num3(maybeParse(spec.rotation), [0, 0, 0]);
+		const rel = matMul(matMul(PinvR, T.R), eulerToMat(extraRot));
+		const rot = matToEuler(rel).map((v) => (Math.abs(v) < 1e-4 ? 0 : v));
+		out.from = [local[0] - size[0] / 2, local[1] - size[1] / 2, local[2] - size[2] / 2].map(R3);
+		out.to = [local[0] + size[0] / 2, local[1] + size[1] / 2, local[2] + size[2] / 2].map(R3);
+		out.origin = local.map(R3);
+		out.rotation = rot;
+		out.parent = parent || undefined;
+		out._attached = { to: target.name, face };
+		return out;
+	}
+	if (spec.size && (spec.center || !spec.from)) {
+		const size = num3(maybeParse(spec.size), [1, 1, 1]);
+		const c = num3(maybeParse(spec.center), [0, size[1] / 2, 0]);
+		out.from = [c[0] - size[0] / 2, c[1] - size[1] / 2, c[2] - size[2] / 2].map(R3);
+		out.to = [c[0] + size[0] / 2, c[1] + size[1] / 2, c[2] + size[2] / 2].map(R3);
+		if (!spec.origin) out.origin = c.map(R3);
+	}
+	return out;
+}
+
+/** The mirror image of a resolved spec across the model's left/right plane. */
+function mirrorCubeSpec(spec, created) {
+	const o = orientation();
+	const i = o.side_index;
+	const m = Object.assign({}, spec);
+	const from = num3(spec.from, [0, 0, 0]), to = num3(spec.to, [1, 1, 1]);
+	const nf = from.slice(), nt = to.slice();
+	nf[i] = -to[i]; nt[i] = -from[i];
+	m.from = nf; m.to = nt;
+	const origin = num3(spec.origin, from).slice();
+	origin[i] = -origin[i];
+	m.origin = origin;
+	const rot = num3(spec.rotation, [0, 0, 0]).slice();
+	// Mirroring across axis i flips the rotations about the other two axes.
+	for (let k = 0; k < 3; k++) if (k !== i) rot[k] = rot[k] ? -rot[k] : 0;
+	m.rotation = rot;
+	m.name = swapSideInName(spec.name);
+	if (spec.side) m.side = String(spec.side).toLowerCase() === 'left' ? 'right' : 'left';
+	const par = spec.parent;
+	const parName = par && typeof par === 'object' ? par.name : par;
+	if (parName && sideFromName(parName)) {
+		const twinName = swapSideInName(parName);
+		const twin = (created && created[twinName]) || findGroup(twinName);
+		if (twin) m.parent = twin;
+	}
+	delete m.mirror;
+	return m;
+}
+
+/**
+ * Expand a batch: resolve placement, then add mirror twins. A spec with
+ * mirror:true and no side in its name gets _right/_left from where it sits.
+ */
+function expandCubeSpecs(specs, created) {
+	const out = [];
+	const o = orientation();
+	for (const raw of specs) {
+		const spec = resolveCubePlacement(maybeParse(raw), created);
+		if (spec.mirror) {
+			const center = (num3(spec.from, [0, 0, 0])[o.side_index] + num3(spec.to, [1, 1, 1])[o.side_index]) / 2;
+			const side = spec.side || sideFromName(spec.name) || sideOfCoord(center, 0.01);
+			if (side === 'center') {
+				throw new Error(`"${spec.name}": mirror:true needs the cube off the centre line (it sits at ${o.right_axis[1]}=${R3(center)}). Move it to one side first.`);
+			}
+			if (!sideFromName(spec.name || 'cube')) spec.name = `${spec.name || 'cube'}_${side}`;
+			spec.side = side;
+			out.push(spec);
+			out.push(mirrorCubeSpec(spec, created));
+		} else {
+			out.push(spec);
+		}
+	}
+	return out;
+}
+
+/** Create cubes from expanded specs (shared by add_cube and add_cubes). */
+function buildCubesFromSpecs(specs, created) {
+	const cubes = [];
+	for (const spec of specs) {
+		let parent = null;
+		if (spec.parent) {
+			parent = typeof spec.parent === 'object' ? spec.parent : ((created && created[spec.parent]) || findGroup(spec.parent));
+			if (!parent) throw new Error('Parent group not found: ' + spec.parent);
+		}
+		const from = num3(spec.from, [0, 0, 0]);
+		const to = num3(spec.to, [from[0] + 1, from[1] + 1, from[2] + 1]);
+		const cube = new Cube({
+			name: sideNameFor(spec.name || 'cube', spec.side),
+			from: [Math.min(from[0], to[0]), Math.min(from[1], to[1]), Math.min(from[2], to[2])],
+			to: [Math.max(from[0], to[0]), Math.max(from[1], to[1]), Math.max(from[2], to[2])],
+			origin: num3(spec.origin, from),
+			rotation: num3(spec.rotation, [0, 0, 0]),
+			inflate: Number(spec.inflate) || 0,
+			autouv: typeof spec.autouv === 'number' ? spec.autouv : (Format.box_uv ? 0 : 1),
+			box_uv: spec.box_uv !== undefined ? !!spec.box_uv : !!Format.box_uv,
+			uv_offset: Array.isArray(spec.uv_offset) ? spec.uv_offset : undefined,
+		}).init();
+		cube.addTo(parent || 'root');
+		if (spec.faces) applyFaces(cube, spec.faces);
+		else if (Texture.all.length) cube.applyTexture(Texture.getDefault(), true);
+		if (created) created[cube.name] = cube;
+		cubes.push(cube);
+	}
+	return cubes;
 }
 
 const commands = {
@@ -3830,31 +6211,7 @@ const commands = {
 
 	add_cube(p) {
 		requireProject();
-		const parent = p.parent ? findGroup(p.parent) : null;
-		if (p.parent && !parent) throw new Error('Parent group not found: ' + p.parent);
-		const from = num3(p.from, [0, 0, 0]);
-		const to = num3(p.to, [from[0] + 1, from[1] + 1, from[2] + 1]);
-		const cubeName = sideNameFor(p.name || 'cube', p.side);
-		const si = orientation().side_index;
-		assertSide(cubeName, p.side, (from[si] + to[si]) / 2, 'cube');
-		Undo.initEdit({ outliner: true, elements: [] });
-		const cube = new Cube({
-			name: cubeName,
-			from,
-			to,
-			origin: num3(p.origin, from),
-			rotation: num3(p.rotation, [0, 0, 0]),
-			inflate: Number(p.inflate) || 0,
-			autouv: typeof p.autouv === 'number' ? p.autouv : (Format.box_uv ? 0 : 1),
-			box_uv: p.box_uv !== undefined ? !!p.box_uv : !!Format.box_uv,
-			uv_offset: Array.isArray(p.uv_offset) ? p.uv_offset : undefined,
-		}).init();
-		cube.addTo(parent || 'root');
-		if (p.faces) applyFaces(cube, p.faces);
-		else if (Texture.all.length) cube.applyTexture(Texture.getDefault(), true);
-		Undo.finishEdit('MCP: add cube');
-		Canvas.updateAll();
-		return serializeElement(cube);
+		return commands.add_cubes(Object.assign({}, p, { cubes: [Object.assign({}, p)], _single: true }));
 	},
 
 	// Build many bones at once. Parents may reference bones created earlier in
@@ -3897,42 +6254,56 @@ const commands = {
 	},
 
 	// Build many cubes at once — the efficient way to author a detailed model.
+	// Each spec is from/to, or center+size, or attach:{to,face,at,embed}+size;
+	// mirror:true adds the left/right twin. Coplanar faces are fixed on the way.
 	add_cubes(p) {
 		requireProject();
-		if (!Array.isArray(p.cubes) || !p.cubes.length) throw new Error('cubes (array) is required');
+		const list = toList(maybeParse(p.cubes)).map(maybeParse);
+		if (!list.length) throw new Error('cubes (array) is required');
 		const si = orientation().side_index;
-		p.cubes.forEach((spec) => {
-			const from = num3(spec.from, [0, 0, 0]);
-			const to = num3(spec.to, [from[0] + 1, from[1] + 1, from[2] + 1]);
-			assertSide(sideNameFor(spec.name || 'cube', spec.side), spec.side, (from[si] + to[si]) / 2, 'cube');
+		// Validate the whole batch first — a half-created batch is worse than none.
+		// (attach may point at a cube made earlier in this call; those are
+		// checked when they are built.)
+		list.forEach((raw) => {
+			if (raw.attach) return;
+			expandCubeSpecs([raw], {}).forEach((spec) => {
+				const from = num3(spec.from, [0, 0, 0]);
+				const to = num3(spec.to, [from[0] + 1, from[1] + 1, from[2] + 1]);
+				assertSide(sideNameFor(spec.name || 'cube', spec.side), spec.side, (from[si] + to[si]) / 2, 'cube');
+			});
 		});
 		Undo.initEdit({ outliner: true, elements: [] });
-		const out = [];
-		const warnings = [];
-		for (const spec of p.cubes) {
-			const parent = spec.parent ? findGroup(spec.parent) : null;
-			if (spec.parent && !parent) throw new Error('Parent group not found: ' + spec.parent);
-			const from = num3(spec.from, [0, 0, 0]);
-			const to = num3(spec.to, [from[0] + 1, from[1] + 1, from[2] + 1]);
-			const cube = new Cube({
-				name: sideNameFor(spec.name || 'cube', spec.side),
-				from,
-				to,
-				origin: num3(spec.origin, from),
-				rotation: num3(spec.rotation, [0, 0, 0]),
-				inflate: Number(spec.inflate) || 0,
-				autouv: typeof spec.autouv === 'number' ? spec.autouv : (Format.box_uv ? 0 : 1),
-				box_uv: spec.box_uv !== undefined ? !!spec.box_uv : !!Format.box_uv,
-				uv_offset: Array.isArray(spec.uv_offset) ? spec.uv_offset : undefined,
-			}).init();
-			cube.addTo(parent || 'root');
-			if (spec.faces) applyFaces(cube, spec.faces);
-			else if (Texture.all.length) cube.applyTexture(Texture.getDefault(), true);
-			out.push(serializeElement(cube));
+		const created = {};
+		const cubes = [];
+		try {
+			for (const raw of list) {
+				const specs = expandCubeSpecs([raw], created);
+				specs.forEach((spec) => {
+					const from = num3(spec.from, [0, 0, 0]);
+					const to = num3(spec.to, [from[0] + 1, from[1] + 1, from[2] + 1]);
+					assertSide(sideNameFor(spec.name || 'cube', spec.side), spec.side, (from[si] + to[si]) / 2, 'cube');
+				});
+				buildCubesFromSpecs(specs, created).forEach((c) => cubes.push(c));
+			}
+		} catch (e) {
+			// Leave nothing half-built behind.
+			cubes.forEach((c) => { try { c.remove(); } catch (_) {} });
+			Undo.cancelEdit ? Undo.cancelEdit() : Undo.finishEdit('MCP: add cubes (failed)');
+			throw e;
 		}
-		Undo.finishEdit('MCP: add cubes');
+		Undo.finishEdit(p._single ? 'MCP: add cube' : 'MCP: add cubes');
 		Canvas.updateAll();
-		return { created: out.length, cubes: out };
+		const warnings = [];
+		cubes.forEach((c) => { const w = sideWarning(c); if (w) warnings.push(w); });
+		const fix = 'Move or inflate one of the cubes by >=0.05.';
+		if (p._single && cubes.length === 1) {
+			const res = serializeElement(cubes[0]);
+			if (warnings.length) res.warning = warnings[0];
+			return reportZFighting(res, cubes, fix, p);
+		}
+		const res = { created: cubes.length, cubes: cubes.map(serializeElement) };
+		if (warnings.length) res.warnings = warnings;
+		return reportZFighting(res, cubes, fix, p);
 	},
 
 	// ===== PROCEDURAL GENERATORS ==========================================
@@ -4071,7 +6442,7 @@ const commands = {
 		if (skipped.length) res.skipped = skipped.slice(0, 10);
 		res.next = 'pack_uv after the last geometry call, then detail_cubes / paint_faces.';
 		return reportZFighting(res, cubes,
-			'Give the overlapping palette entries different `offset_z`/`depth` values so their faces do not line up, or move the whole grid by >=0.1 off whatever it sits on.');
+			'Give the overlapping palette entries different `offset_z`/`depth` values so their faces do not line up, or move the whole grid by >=0.1 off whatever it sits on.', p);
 	},
 
 	/**
@@ -4174,7 +6545,7 @@ const commands = {
 		if (warnings.length) res.warnings = warnings;
 		res.note = 'Walls do not overlap each other, so they cannot z-fight. Anything you put INSIDE the cavity (a face, a skull, a glow core) should sit at least 0.1 clear of the walls.';
 		return reportZFighting(res, cubes,
-			'The walls cannot fight each other, so this is the shell against geometry that was already there: move the bounds by >=0.1 so no face lines up with the part underneath.');
+			'The walls cannot fight each other, so this is the shell against geometry that was already there: move the bounds by >=0.1 so no face lines up with the part underneath.', p);
 	},
 
 	/**
@@ -4360,7 +6731,7 @@ const commands = {
 			res.hint = 'depth_stagger was 0 and neighbouring elements overlap, so they sit at the same depth and will z-fight. Pass depth_stagger 0.05-0.2 for overlapping rows (scales, shingles, plates).';
 		}
 		return reportZFighting(res, cubes,
-			'depth_stagger only alternates neighbours, so a row where each element overlaps two or more others still lines up (i and i+2 share a depth), and elements at the same height share their top/bottom planes. Fix: raise `jitter` above 0.05 on the axes that align, space the elements about one element_size apart, or add a small `rotation_range`.');
+			'depth_stagger only alternates neighbours, so a row where each element overlaps two or more others still lines up (i and i+2 share a depth), and elements at the same height share their top/bottom planes. Fix: raise `jitter` above 0.05 on the axes that align, space the elements about one element_size apart, or add a small `rotation_range`.', p);
 	},
 
 	/**
@@ -4494,7 +6865,7 @@ const commands = {
 			res.warning = 'This is an animated format and the chain has no bones. Pass create_bones:true unless the chain is meant to be rigid.';
 		}
 		return reportZFighting(res, cubes,
-			'Segments meet end to end, so this is the chain against what it grows out of: move `base_origin` by >=0.1 so the first segment penetrates its base instead of sitting flush on it.');
+			'Segments meet end to end, so this is the chain against what it grows out of: move `base_origin` by >=0.1 so the first segment penetrates its base instead of sitting flush on it.', p);
 	},
 
 	/**
@@ -4751,7 +7122,7 @@ const commands = {
 			res.note += ` Membrane strips are ~${R3(step)} wide; lower membrane_step for a smoother trailing edge, raise it for fewer cubes.`;
 		}
 		return reportZFighting(res, cubes,
-			'Move base_origin by >=0.1 so the shoulder joint cube is not flush with the body it grows out of.');
+			'Move base_origin by >=0.1 so the shoulder joint cube is not flush with the body it grows out of.', p);
 	},
 
 	/**
@@ -4992,8 +7363,11 @@ const commands = {
 		else cubes = toList(p.cubes).map(findElement).filter((c) => c instanceof Cube);
 		if (!cubes.length) throw new Error('No cubes to pack.');
 		const pad = p.padding != null ? p.padding | 0 : 1;
+		const mode = ['box', 'faces', 'auto'].includes(p.mode) ? p.mode : 'auto';
+		const tex0 = Texture.all[0];
+		const ppu = tex0 && Project.texture_width ? Math.max(1, Math.round(tex0.width / Project.texture_width)) : 1;
 		Undo.initEdit({ elements: cubes, uv_only: true });
-		let res = packBoxUV(cubes, Project.texture_width, pad);
+		let res = packUV(cubes, Project.texture_width, pad, mode, ppu);
 		if (p.auto_resize !== false && res.used[1] > Project.texture_height) {
 			let newH = Project.texture_height || 16;
 			while (newH < res.used[1]) newH *= 2;
@@ -5006,12 +7380,18 @@ const commands = {
 				if (t.img) { try { x.drawImage(t.img, 0, 0); } catch (e) {} }
 				t.updateSource(c.toDataURL()); t.width = newW; t.height = newH;
 			});
-			res = packBoxUV(cubes, newW, pad);
+			res = packUV(cubes, newW, pad, mode, ppu);
 			updateProjectResolution && updateProjectResolution();
 		}
 		Undo.finishEdit('MCP: pack UV');
 		Canvas.updateAll();
-		return { packed: res.packed, used: res.used, texture_size: [Project.texture_width, Project.texture_height] };
+		const out = { packed: res.packed, box_uv: res.box_uv, per_face_uv: res.per_face, used: res.used, texture_size: [Project.texture_width, Project.texture_height] };
+		if (res.per_face && Format.box_uv) out.note = `${res.per_face} cube(s) that are thinner than 1 unit or off the pixel grid got per-face UV, so every face gets whole, evenly sized pixels (box UV would collapse or stretch them). Pass mode:"box" to force box UV.`;
+		if (Format.box_uv && !Format.optional_box_uv) {
+			const thin = cubes.filter((c) => [0, 1, 2].some((i) => { const v = Math.abs(c.to[i] - c.from[i]); return v > 0 && v < 0.999; }));
+			if (thin.length) out.warning = `${thin.length} cube(s) are thinner than 1 unit, and this format only has box UV, so those faces get no pixels. Make them at least 1 thick and use inflate to slim them visually.`;
+		}
+		return out;
 	},
 
 	// Create a flat 2-sided plane (billboard) — the building block of pixel VFX:
@@ -5225,37 +7605,79 @@ const commands = {
 				issues.push({ cube: cube.name, issue: 'no_bone_parent' });
 		});
 
-		// Z-FIGHTING / clipping detection: two faces sharing the same plane and
-		// overlapping in area will flicker (the "two squares inside one another"
-		// texture-clip). We flag unrotated cube pairs that share a min- or max-
-		// plane on an axis AND overlap by real area on the other two axes (their
-		// coplanar faces point the SAME way, so both render and fight). Fix by
-		// offsetting one cube by >=0.1 (or insetting it) so the faces aren't coplanar.
-		const ortho = Cube.all.filter((c) => c.rotation && c.rotation.every((r) => Math.abs(r) < 0.001));
-		const keys = ortho.map(rotatedBoneKey);
-		const ov =(a1, a2, b1, b2) => Math.min(a2, b2) - Math.max(a1, b1);
-		const zEps = 0.02;
-		let zFights = 0;
-		for (let i = 0; i < ortho.length && zFights < 80; i++) {
-			for (let j = i + 1; j < ortho.length && zFights < 80; j++) {
-				const a = ortho[i], b = ortho[j];
-				if (keys[i] !== keys[j]) continue;
-				for (let ax = 0; ax < 3; ax++) {
-					const o1 = (ax + 1) % 3, o2 = (ax + 2) % 3;
-					if (ov(a.from[o1], a.to[o1], b.from[o1], b.to[o1]) <= 0.1) continue;
-					if (ov(a.from[o2], a.to[o2], b.from[o2], b.to[o2]) <= 0.1) continue;
-					const sameMin = Math.abs(a.from[ax] - b.from[ax]) < zEps;
-					const sameMax = Math.abs(a.to[ax] - b.to[ax]) < zEps;
-					if (sameMin || sameMax) {
-						issues.push({
-							issue: 'coplanar_overlap', cubes: [a.name, b.name],
-							axis: ['x', 'y', 'z'][ax], plane: sameMin ? a.from[ax] : a.to[ax],
-							hint: 'faces coplanar -> z-fight; offset one cube by >=0.1 on this axis',
-						});
-						zFights++;
-						break;
-					}
+		// Z-FIGHTING: two faces pointing the same way, on the same plane, overlapping
+		// in area. Checked in WORLD space (rotations, bones and inflate included),
+		// because that is what the renderer draws.
+		const zPairs = findZFighting({ limit: 300 });
+		zPairs.forEach((pr) => {
+			issues.push({
+				issue: pr.duplicate ? 'duplicate_cube' : 'coplanar_overlap',
+				cubes: [pr.a.cube.name, pr.b.cube.name],
+				faces: [pr.face_a, pr.face_b],
+				overlap_area: R3(pr.area),
+				hint: pr.duplicate
+					? 'two identical cubes in the same place — delete one'
+					: 'faces share a plane and flicker — run fix_z_fighting, or move/inflate the smaller cube by >=0.05',
+			});
+		});
+
+		// HIDDEN CUBES: fully inside a bigger cube — never seen, still exported.
+		findHiddenCubes(40).forEach(({ a, b }) => {
+			issues.push({ issue: 'hidden_cube', cube: a.cube.name, inside: b.cube.name, hint: 'completely inside another cube: invisible but still costs a cube — delete it or let it stick out' });
+		});
+
+		// FLOATING PARTS: islands that touch nothing — a belt hovering off the
+		// waist, an eye floating in front of the face.
+		const floating = findFloatingParts();
+		floating.forEach((f) => {
+			issues.push({
+				issue: 'floating_part', cubes: f.cubes, cube_count: f.cube_count, gap: f.gap_to_main_body,
+				hint: `this part touches nothing else (${f.gap_to_main_body} units away from the main body). Move it until it overlaps what it should hang on by ~0.1-0.5, or ignore if it is meant to float (a halo, an orb, VFX).`,
+			});
+		});
+
+		// PIXEL GRID: with box UV a cube's size IS its texture footprint. Sizes off
+		// the pixel grid smear pixels across faces at uneven widths — the "blurry,
+		// mismatched pixels" look. Per-face UV gets the same check as texel density.
+		const tex0 = Texture.all && Texture.all[0];
+		const ppu = tex0 && tw ? (tex0.width / tw) : 1;
+		const offGrid = [];
+		const densities = [];
+		Cube.all.forEach((cube) => {
+			const s = [cube.to[0] - cube.from[0], cube.to[1] - cube.from[1], cube.to[2] - cube.from[2]];
+			if (cube.box_uv) {
+				const bad = s.some((v) => v > 0 && Math.abs(v * ppu - Math.round(v * ppu)) > 0.02);
+				if (bad) offGrid.push({ cube: cube.name, size: s.map(R3) });
+			} else {
+				const sz = { north: [0, 1], south: [0, 1], east: [2, 1], west: [2, 1], up: [0, 2], down: [0, 2] };
+				for (const dir in cube.faces) {
+					const f = cube.faces[dir];
+					if (!f || !f.texture || !sz[dir]) continue;
+					const u = f.uv || [0, 0, 0, 0];
+					const fw = Math.abs(s[sz[dir][0]]), fh = Math.abs(s[sz[dir][1]]);
+					if (fw * ppu < 2 || fh * ppu < 2) continue;
+					const rot = f.rotation === 90 || f.rotation === 270;
+					const uw = Math.abs(u[2] - u[0]), uh = Math.abs(u[3] - u[1]);
+					densities.push({ cube: cube.name, face: dir, d: ((rot ? uh : uw) / fw + (rot ? uw : uh) / fh) / 2 });
 				}
+			}
+		});
+		if (offGrid.length) {
+			issues.push({
+				issue: 'off_pixel_grid', count: offGrid.length, examples: offGrid.slice(0, 8),
+				hint: `${offGrid.length} box-UV cube(s) have sizes that are not whole texture pixels (${R3(ppu)} px per unit), so their texture pixels come out stretched and uneven. Snap sizes to multiples of ${R3(1 / ppu)} and use inflate (which does not touch UVs) for small offsets.`,
+			});
+		}
+		if (densities.length > 3) {
+			const sorted = densities.map((x) => x.d).sort((a, b) => a - b);
+			const med = sorted[sorted.length >> 1];
+			const odd = densities.filter((x) => med > 0 && (x.d / med > 1.4 || x.d / med < 0.7));
+			if (odd.length) {
+				issues.push({
+					issue: 'texel_density_mismatch', count: odd.length, median_uv_per_unit: R3(med),
+					examples: odd.slice(0, 8).map((x) => ({ cube: x.cube, face: x.face, uv_per_unit: R3(x.d) })),
+					hint: 'these faces have a much bigger or smaller UV than their size, so their pixels look stretched or tiny next to the rest. Re-run pack_uv / unwrap so every face gets the same pixels per unit.',
+				});
 			}
 		}
 
@@ -5264,12 +7686,64 @@ const commands = {
 
 		const byType = {};
 		issues.forEach((i) => { byType[i.issue] = (byType[i.issue] || 0) + 1; });
+		// One line per cube for per-face problems, and a cap, so a fresh untextured
+		// model does not bury the z-fighting and floating-part findings.
+		const grouped = [];
+		const perCube = {};
+		issues.forEach((i) => {
+			if (i.face && (i.issue === 'no_texture' || i.issue === 'zero_uv' || i.issue === 'uv_out_of_bounds')) {
+				const k = i.issue + '|' + i.cube;
+				if (!perCube[k]) { perCube[k] = { cube: i.cube, issue: i.issue, faces: [] }; grouped.push(perCube[k]); }
+				perCube[k].faces.push(i.face);
+			} else grouped.push(i);
+		});
+		const rank = (i) => (i.issue === 'no_texture' ? 3 : i.issue === 'zero_uv' ? 2 : 0);
+		grouped.sort((a, b) => rank(a) - rank(b));
+		const limit = 80;
+		const hints = [];
+		if (byType.no_texture) hints.push('no_texture: run pack_uv, create_texture, then detail_cubes.');
+		if (byType.zero_uv) hints.push('zero_uv: faces with no pixels — run pack_uv (it gives thin cubes per-face UV where the format allows).');
 		return {
 			cubes: Cube.all.length, groups: Group.all.length, textures: Texture.all.length,
 			texture_size: [tw, th], animation_format: animMode,
 			orientation: orientationReport().summary,
-			issue_count: issues.length, by_type: byType, issues,
+			issue_count: issues.length, by_type: byType,
+			issues: grouped.slice(0, limit),
+			truncated: grouped.length > limit ? grouped.length - limit : undefined,
+			hints: hints.length ? hints : undefined,
 		};
+	},
+
+	/**
+	 * Find every pair of coplanar overlapping faces (world space) and resolve
+	 * them by growing the smaller cube of each pair outward with inflate. Box UVs
+	 * are untouched. Repeats until clean, so rows alternate instead of re-colliding.
+	 */
+	fix_z_fighting(p) {
+		requireProject();
+		p = p || {};
+		const before = findZFighting({ limit: 2000 });
+		if (!before.length) return { found: 0, fixed: 0, remaining: 0, note: 'No coplanar overlapping faces — nothing to fix.' };
+		const focus = p.cubes && p.cubes !== 'all'
+			? toList(p.cubes).map(findElement).filter((c) => c instanceof Cube)
+			: null;
+		Undo.initEdit({ elements: Cube.all.slice() });
+		const r = fixZFighting({ step: p.step, focus });
+		Undo.finishEdit('MCP: fix z-fighting');
+		Canvas.updateAll();
+		const res = {
+			found: before.length,
+			fixed: before.length - r.remaining,
+			cubes_nudged: r.fixed_cubes.length,
+			nudged: r.fixed_cubes.slice(0, 20),
+			remaining: r.remaining,
+		};
+		if (r.remaining) res.remaining_examples = r.remaining_examples;
+		if (r.duplicates.length) {
+			res.duplicates = r.duplicates;
+			res.duplicate_hint = 'These pairs are identical cubes in the same place: the fix hides one inside the other, but you almost certainly meant to delete one.';
+		}
+		return res;
 	},
 
 	// ---- UV / textures on faces ------------------------------------------
@@ -5458,6 +7932,45 @@ const commands = {
 		else cubes = toList(p.cubes).map(findElement).filter((c) => c instanceof Cube);
 		if (!cubes.length) throw new Error('No matching cubes.');
 
+		const style = String(p.style || 'painted').toLowerCase();
+		if (style !== 'smooth') {
+			// Rules may come as `materials` and/or the older `colors` (array or {regex: colour}).
+			const asRules = (v) => {
+				v = maybeParse(v);
+				if (!v) return [];
+				if (Array.isArray(v)) return v.map(maybeParse);
+				if (typeof v === 'object') return Object.keys(v).map((k) => (typeof v[k] === 'string' ? { match: k, color: v[k] } : Object.assign({ match: k }, v[k])));
+				return [];
+			};
+			const rules = asRules(p.materials).concat(asRules(p.colors));
+			Undo.initEdit({ elements: cubes });
+			cubes.forEach((cube) => { for (const dir in cube.faces) if (cube.faces[dir]) cube.faces[dir].texture = tex.uuid; });
+			Undo.finishEdit('MCP: assign texture');
+			const stats = paintEngineBake(tex, cubes, {
+				rules,
+				base: p.base,
+				ao: p.ao,
+				bevel: p.bevel,
+				light: maybeParse(p.light),
+				seed: p.seed,
+				finish: p.finish,
+				ground_dark: p.ground_dark,
+				vary: p.vary,
+				glow_re: p.glow_regex ? new RegExp(p.glow_regex, 'i') : null,
+			});
+			Canvas.updateAll();
+			const res = {
+				textured: cubes.length, faces: stats.faces, pixels: stats.pixels,
+				materials_used: stats.materials, finish: p.finish || 'painted',
+				texture: serializeTexture(tex),
+			};
+			if (stats.uv_overlap_pixels > 0) {
+				res.warning = `${stats.uv_overlap_pixels} texture pixels are shared by faces of different cubes, so the later cube painted over the earlier one. Run pack_uv, then detail_cubes again.`;
+			}
+			res.next = 'paint_face for eyes/mouth on the head, paint_faces for any other crisp feature, then screenshot_views. Re-run detail_cubes after changing geometry — the shading (AO, bevels) comes from it.';
+			return res;
+		}
+
 		const base = p.base || '#9c9c9c';
 		const colors = p.colors || null;                              // region colour map
 		const mottle = p.noise != null ? Number(p.noise) : 0.06;       // subtle, low default
@@ -5542,6 +8055,73 @@ const commands = {
 
 		Canvas.updateAll();
 		return { textured: cubes.length, faces: jobs.length, smooth: true, texture: serializeTexture(tex) };
+	},
+
+	/**
+	 * Paint a face (eyes, brows, mouth, blush, nose) onto a head cube, as pixel
+	 * art in the face's own grid, upright as seen by someone facing the model.
+	 */
+	paint_face(p) {
+		requireProject();
+		p = p || {};
+		const cube = findElement(p.cube || 'head');
+		if (!cube || !(cube instanceof Cube)) throw new Error(`Cube not found: "${p.cube || 'head'}". Pass the name of the head cube.`);
+		const dir = normalizeFaceName(p.face || 'front');
+		const face = cube.faces[dir];
+		if (!face) throw new Error(`Cube "${cube.name}" has no ${dir} face.`);
+		let tex = p.texture ? findTexture(p.texture) : (face.texture ? findTexture(face.texture) : null);
+		if (!tex && Texture.getDefault) tex = Texture.getDefault();
+		if (!tex) tex = Texture.all[0];
+		if (!tex) throw new Error('No texture. Run pack_uv, create_texture and detail_cubes first, then paint the face.');
+		face.texture = tex.uuid;
+		const scale = tex.width / (Project.texture_width || tex.width);
+		const X = nodeWorld(cube);
+		const frame = facePaintFrame(cube, dir, face, scale, X);
+		if (!frame) throw new Error(`The ${dir} face of "${cube.name}" has no UV area. Run pack_uv first.`);
+		const { cells, Wf, Hf } = faceGrid(frame, X, scale);
+		const r = frame.r;
+		if (Wf < 4 || Hf < 4) throw new Error(`The ${dir} face of "${cube.name}" is only ${Wf}x${Hf} pixels — too small for a face. Make the head at least 6 units wide or raise the texture resolution.`);
+
+		const canvasData = (() => {
+			try {
+				const c = document.createElement('canvas');
+				c.width = tex.width; c.height = tex.height;
+				const x = c.getContext('2d');
+				x.drawImage(tex.canvas || tex.img, 0, 0);
+				return x.getImageData(0, 0, tex.width, tex.height).data;
+			} catch (e) { return null; }
+		})();
+		let skinRgb = p.skin ? hexToRgb(p.skin) : null;
+		if (!skinRgb && canvasData) {
+			const ci = ((r.y + (r.h >> 1)) * tex.width + (r.x + (r.w >> 1))) * 4;
+			skinRgb = [canvasData[ci], canvasData[ci + 1], canvasData[ci + 2]];
+		}
+		const render = renderFaceFeatures(Wf, Hf, Object.assign({}, p, { skin_rgb: skinRgb || [236, 196, 176] }));
+		const grid = render.grid;
+		let painted = 0;
+		tex.edit((canvas) => {
+			const ctx = canvas.getContext('2d');
+			ctx.imageSmoothingEnabled = false;
+			const img = ctx.getImageData(r.x, r.y, r.w, r.h);
+			const d = img.data;
+			cells.forEach(([i, j, fx, fy]) => {
+				const cell = grid[fy] && grid[fy][fx];
+				if (!cell) return;
+				const o = (j * r.w + i) * 4;
+				const mix = cell.mix != null ? cell.mix : 1;
+				d[o] = clamp8(d[o] * (1 - mix) + cell.c[0] * mix);
+				d[o + 1] = clamp8(d[o + 1] * (1 - mix) + cell.c[1] * mix);
+				d[o + 2] = clamp8(d[o + 2] * (1 - mix) + cell.c[2] * mix);
+				d[o + 3] = 255;
+				painted++;
+			});
+			ctx.putImageData(img, r.x, r.y);
+		}, { edit_name: 'MCP: paint face', no_undo: false });
+		Canvas.updateAll();
+		return {
+			cube: cube.name, face: dir, pixels_painted: painted, layout: render.layout,
+			note: `Painted on a ${Wf}x${Hf}px face. Viewer-left eye is the model's RIGHT eye. Tune eye_width/eye_height/eye_gap/eye_y (pixels) if it does not match the reference, then screenshot the front.`,
+		};
 	},
 
 	// Paint specific cube faces using coordinates RELATIVE to each face's UV
@@ -6166,9 +8746,59 @@ const commands = {
 	// 'right','top','bottom','isometric_right_front',...) or {position,target}.
 	async screenshot_views(p) {
 		requireProject();
-		const views = (p && Array.isArray(p.views) && p.views.length) ? p.views : DEFAULT_VIEWS;
-		const shots = await captureViews(views, p || {});
-		return { count: shots.length, orientation: orientationReport().summary, shots };
+		p = p || {};
+		const views = (Array.isArray(p.views) && p.views.length) ? p.views : DEFAULT_VIEWS;
+		const shots = await captureViews(views, p);
+		const out = { count: shots.length, orientation: orientationReport().summary, shots };
+		// The whole-body views hide the small things that are wrong; add close-ups.
+		const limit = p.inspect === false ? 0 : Math.max(0, Math.min(8, Math.round(numOr(p.inspect_limit, 4))));
+		if (limit && Cube.all.length) {
+			const pts = collectInspectionPoints({});
+			const pick = pts.slice(0, limit);
+			const close = await captureInspections(pick, p);
+			shots.push(...close);
+			out.count = shots.length;
+			out.inspected = close.map((s) => s.note);
+			const problems = pts.filter((x) => x.priority <= 4);
+			if (problems.length > pick.filter((x) => x.priority <= 4).length) out.more_problems = `${problems.length} problem spot(s) in total — inspect_model {limit:${Math.min(12, problems.length)}} shows the rest.`;
+		}
+		return out;
+	},
+
+	/**
+	 * Close-ups of the spots where models go wrong: z-fighting, duplicate and
+	 * hidden cubes, floating parts, left/right mix-ups — then the detail spots
+	 * worth checking anyway (face, hands, feet, joints, gear contacts). Each shot
+	 * clips away what stands in front and outlines the cubes involved.
+	 */
+	async inspect_model(p) {
+		requireProject();
+		p = p || {};
+		if (!Cube.all.length) throw new Error('The model has no cubes yet.');
+		const kinds = p.kinds ? toList(maybeParse(p.kinds)).map((k) => String(k).toLowerCase()) : null;
+		let pts = collectInspectionPoints({ kinds });
+		if (p.problems_only) pts = pts.filter((x) => x.priority <= 4);
+		const at = maybeParse(p.at);
+		if (Array.isArray(at) && at.length === 3) {
+			pts.unshift({ kind: 'custom', priority: 0, center: num3(at), size: numOr(p.size, 4), dir: viewOffsetDir(p.view || 'front_right') || viewOffsetDir('front_right'), cubes: [], labels: [p.label || 'requested spot'], count: 1, fix: '' });
+		}
+		if (p.cubes) {
+			const cubes = toList(maybeParse(p.cubes)).map(findElement).filter((c) => c instanceof Cube);
+			if (cubes.length) {
+				const b = boundsOfCubes(cubes.map((c) => { const w = cubeWorldInfo(c); return { from: w.min, to: w.max }; }));
+				pts.unshift({ kind: 'custom', priority: 0, center: b.min.map((v, k) => (v + b.max[k]) / 2), size: Math.max(1.5, ...b.size), dir: viewOffsetDir(p.view || 'front_right') || viewOffsetDir('front_right'), cubes, labels: [cubes.map((c) => c.name).slice(0, 4).join(', ')], count: 1, fix: '' });
+			}
+		}
+		const limit = Math.max(1, Math.min(16, Math.round(numOr(p.limit, 8))));
+		const pick = pts.slice(0, limit);
+		const shots = await captureInspections(pick, p);
+		const problems = pts.filter((x) => x.priority >= 1 && x.priority <= 4).length;
+		return {
+			count: shots.length, problem_spots: problems, total_spots: pts.length,
+			summary: pick.map((x, i) => `#${i + 1} ${x.kind}: ${x.labels[0]}`),
+			shots,
+			next: problems ? 'Fix the outlined problems (fix_z_fighting, move floating parts, delete hidden cubes), then inspect_model again.' : 'No geometry problems found. Study the detail close-ups against the reference and refine what reads wrong.',
+		};
 	},
 
 	// ---- orientation / sides ----------------------------------------------
@@ -6379,9 +9009,842 @@ const commands = {
 		return { topic, guide, available_topics: Object.keys(GUIDES) };
 	},
 
+	// ===== ROUND SHAPES & MECHANISMS ======================================
+
+	/** A cylinder (solid) or tube/ring (hollow) along a world axis, built from rotated cubes. */
+	add_cylinder(p) {
+		requireProject();
+		p = p || {};
+		const axis = axisName(p.axis);
+		const center = num3(maybeParse(p.center), [0, 0, 0]);
+		const radius = numOr(p.radius, 2);
+		const length = numOr(p.length, 4);
+		if (!(radius > 0) || !(length > 0)) throw new Error('radius and length must be greater than 0.');
+		const inner = Math.max(0, numOr(p.inner_radius, 0));
+		if (inner >= radius) throw new Error(`inner_radius (${inner}) must be smaller than radius (${radius}).`);
+		let sides = Math.round(numOr(p.sides, radius >= 5 ? 16 : 8));
+		sides = inner ? Math.max(6, Math.min(48, sides)) : Math.max(4, Math.min(32, Math.round(sides / 2) * 2));
+		const name = p.name || (inner ? 'ring' : 'cylinder');
+		const parent = resolveParent(p.parent);
+		Undo.initEdit({ outliner: true, elements: [] });
+		let holder = parent, bone = null;
+		if (p.bone || (p.bone !== false && !parent && Format.animation_mode)) { bone = makeBone(name, center, parent); holder = bone; }
+		const cubes = specsToCubes(holder, cylinderCubes({ axis, center, radius, length, sides, inner_radius: inner, name, phase: numOr(p.phase, 0) }), numOr(p.inflate, 0));
+		Undo.finishEdit('MCP: add cylinder');
+		Canvas.updateAll();
+		const res = generatedReport(cubes, {
+			axis, sides, solid: !inner, bone: bone ? bone.name : null,
+			note: inner
+				? `A ring of ${sides} slabs (a tube). Outer radius ${radius}, inner ${inner}.`
+				: `${cubes.length} band(s) turned ${R3(360 / sides)} deg apart = a regular ${sides}-sided cylinder (radius = its corners). Each band is 0.05 shorter than the last so the end caps never z-fight.`,
+		}, 6);
+		if (Format && Format.id === 'java_block' && (360 / sides) % 22.5) {
+			res.warning = 'Java block models only allow rotations in 22.5 degree steps; use sides 8 or 16 here.';
+		}
+		return reportZFighting(res, cubes, 'Shift the cylinder by >=0.05 along its axis.', p);
+	},
+
+	/**
+	 * A gear on its own bone (pivot on the axle) so it can spin: a disc or a
+	 * spoked rim + hub, a ring of teeth and an axle. mesh_with places it so its
+	 * teeth interleave with an existing gear and records the ratio.
+	 */
+	add_gear(p) {
+		requireProject();
+		p = p || {};
+		const axis = axisName(p.axis || 'z');
+		const reg = gearRegistry();
+		const radius = numOr(p.radius, 5);
+		if (!(radius > 1)) throw new Error('radius (to the tooth tips) must be greater than 1.');
+		const toothH = numOr(p.tooth_height, Math.max(0.8, R3(radius * 0.18)));
+		const thickness = numOr(p.thickness, 2);
+		const pitchR = radius - toothH / 2;
+		const rootR = radius - toothH;
+		let teeth = p.teeth != null ? Math.round(Number(p.teeth)) : null;
+		let center = num3(maybeParse(p.center), [0, 0, 0]);
+		let phase = numOr(p.phase, 0);
+		let meshInfo = null;
+		const warnings = [];
+		const mw = maybeParse(p.mesh_with);
+		if (mw) {
+			const ref = typeof mw === 'string' ? mw : (mw.gear || mw.name);
+			const other = reg[ref];
+			if (!other) throw new Error(`mesh_with: no gear "${ref}" was built with add_gear in this project. Known gears: ${Object.keys(reg).join(', ') || 'none'}.`);
+			if (other.axis !== axis) throw new Error(`mesh_with: "${ref}" turns about ${other.axis}; build this gear with axis "${other.axis}" too.`);
+			const ang = numOr(typeof mw === 'object' ? mw.angle : 0, 0);
+			if (teeth == null) teeth = Math.max(6, Math.round(other.teeth * pitchR / other.pitch_radius));
+			const { U, V } = ringBasis(axis);
+			const a = ang * Math.PI / 180;
+			const dist = other.pitch_radius + pitchR + numOr(typeof mw === 'object' ? mw.clearance : 0, 0.15);
+			center = [0, 1, 2].map((k) => R3(other.center[k] + (U[k] * Math.cos(a) + V[k] * Math.sin(a)) * dist));
+			const pitchA = 360 / other.teeth, pitchB = 360 / teeth;
+			const fA = ((((ang - other.phase) % pitchA) + pitchA) % pitchA) / pitchA;
+			const fB = ((-(fA + 0.5)) % 1 + 1) % 1;
+			phase = R3(ang + 180 - fB * pitchB);
+			const modA = other.pitch_radius / other.teeth, modB = pitchR / teeth;
+			if (Math.abs(modA / modB - 1) > 0.15) warnings.push(`Tooth size differs from "${ref}" by ${Math.round(Math.abs(modA / modB - 1) * 100)}% — real meshing gears share a tooth size. Omit teeth to have it computed (${Math.round(other.teeth * pitchR / other.pitch_radius)}).`);
+			meshInfo = { with: ref, angle: ang, center_distance: R3(dist), ratio: `${other.teeth}:${teeth}`, turns_per_driver_turn: R3(-other.teeth / teeth) };
+		}
+		if (teeth == null) teeth = Math.max(6, Math.round(2 * Math.PI * pitchR / 1.8));
+		if (teeth < 4 || teeth > 96) throw new Error(`teeth ${teeth} is out of range (4-96).`);
+		const toothW = numOr(p.tooth_width, Math.max(0.5, R3(2 * Math.PI * rootR / teeth * 0.5)));
+		const spokes = Math.max(0, Math.round(numOr(p.spokes, radius >= 7 ? 4 : 0)));
+		const hubR = numOr(p.hub_radius, Math.max(0.75, R3(radius * 0.24)));
+		const name = p.name || 'gear';
+		if (findGroup(name)) throw new Error(`A bone named "${name}" already exists. Give each gear its own name.`);
+		const parent = resolveParent(p.parent);
+		const { U } = ringBasis(axis);
+
+		Undo.initEdit({ outliner: true, elements: [] });
+		const bone = makeBone(name, center, parent);
+		const specs = [];
+		if (spokes > 0) {
+			const rimW = numOr(p.rim_width, Math.max(1, R3(radius * 0.16)));
+			specs.push(...cylinderCubes({ axis, center, radius: rootR + 0.1, length: thickness, sides: Math.max(12, Math.min(32, teeth)), inner_radius: Math.max(hubR + 0.5, rootR - rimW), name: `${name}_rim`, phase }));
+			specs.push(...cylinderCubes({ axis, center, radius: hubR, length: thickness + 0.4, sides: 8, name: `${name}_hub`, phase }));
+			const spokeW = numOr(p.spoke_width, Math.max(0.8, R3(radius * 0.12)));
+			const r0 = hubR * 0.6, r1 = rootR - rimW + 0.4;
+			for (let s = 0; s < spokes; s++) {
+				const mid = (r0 + r1) / 2;
+				const pos = [center[0] + U[0] * mid, center[1] + U[1] * mid, center[2] + U[2] * mid];
+				specs.push(Object.assign(boxAround(pos, ringBoxSize(axis, r1 - r0, spokeW, thickness * 0.7)), {
+					name: `${name}_spoke${s + 1}`, origin: center.map(R3), rotation: ringRotation(axis, phase + 360 * s / spokes + 180 / teeth),
+				}));
+			}
+		} else {
+			const discSides = rootR >= 6 ? 16 : rootR >= 3 ? 12 : 8;
+			specs.push(...cylinderCubes({ axis, center, radius: (rootR + 0.1) / Math.cos(Math.PI / discSides), length: thickness, sides: discSides, name: `${name}_disc`, phase }));
+			specs.push(...cylinderCubes({ axis, center, radius: hubR, length: thickness + 0.6, sides: 8, name: `${name}_hub`, phase: phase + 22.5 }));
+		}
+		const radialPos = rootR + toothH / 2 - 0.1;
+		for (let i = 0; i < teeth; i++) {
+			const pos = [center[0] + U[0] * radialPos, center[1] + U[1] * radialPos, center[2] + U[2] * radialPos];
+			specs.push(Object.assign(boxAround(pos, ringBoxSize(axis, toothH + 0.2, toothW, thickness * 0.92)), {
+				name: `${name}_tooth${i + 1}`, origin: center.map(R3), rotation: ringRotation(axis, phase + i * 360 / teeth),
+			}));
+		}
+		if (p.axle !== false) {
+			specs.push(...cylinderCubes({ axis, center, radius: numOr(p.axle_radius, Math.max(0.4, R3(hubR * 0.45))), length: thickness + numOr(p.axle_length, 2), sides: 8, name: `${name}_axle` }));
+		}
+		const cubes = specsToCubes(bone, specs, 0);
+		Undo.finishEdit('MCP: add gear');
+		Canvas.updateAll();
+		reg[name] = { center, axis, teeth, pitch_radius: pitchR, radius, phase, bone: bone.name };
+		const res = generatedReport(cubes, {
+			gear: name, bone: bone.name, center, axis, teeth, radius, pitch_radius: R3(pitchR), spokes,
+			mesh: meshInfo,
+			next: `Mesh another gear with add_gear {mesh_with:{gear:"${name}", angle:0}}; spin them with animate_mechanism {parts:[{bone:"${name}", type:"spin", turns:1}, {bone:"<other>", driven_by:"${name}"}]}.`,
+		}, 4);
+		if (warnings.length) res.warnings = warnings;
+		if (Format && Format.id === 'java_block') res.warning = 'Java block models cannot rotate cubes freely; gears only work in Bedrock / GeckoLib / Generic formats.';
+		return reportZFighting(res, cubes, 'Nudge the gear by >=0.05 along its axis.', p);
+	},
+
+	/** A pipe through a list of points: round segments, joint fittings at bends, flanges at the ends. */
+	add_pipe(p) {
+		requireProject();
+		p = p || {};
+		const pts = toList(maybeParse(p.points)).map((q) => num3(maybeParse(q), [NaN, NaN, NaN]));
+		if (pts.length < 2 || pts.some((q) => q.some((v) => !isFinite(v)))) throw new Error('points: at least two [x,y,z] points are required.');
+		const radius = numOr(p.radius, 1);
+		if (!(radius > 0)) throw new Error('radius must be greater than 0.');
+		const sides = Math.max(4, Math.round(numOr(p.sides, 8) / 2) * 2);
+		const bands = sides === 4 ? [{ angle: 0, radial: 2 * radius * Math.SQRT1_2, tangent: 2 * radius * Math.SQRT1_2 }] : ngonBands(sides, radius, 0);
+		const name = p.name || 'pipe';
+		const joints = String(p.joints || 'box');
+		const parent = resolveParent(p.parent);
+		const specs = [];
+		const segDirs = [];
+		for (let s = 0; s < pts.length - 1; s++) {
+			const a = pts[s], b = pts[s + 1];
+			const d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+			const len = Math.hypot(d[0], d[1], d[2]);
+			if (len < 1e-6) throw new Error(`points ${s} and ${s + 1} are the same.`);
+			const dir = vecScale(d, 1 / len);
+			segDirs.push(dir);
+			const Ra = matYTo(dir);
+			const c = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+			bands.forEach((b, i) => {
+				const R = matMul(Ra, eulerToMat([0, b.angle, 0]));
+				specs.push(Object.assign(boxAround(c, [b.radial, Math.max(0.1, len - i * 0.05), b.tangent]), {
+					name: `${name}_seg${s + 1}${bands.length > 1 ? '_' + (i + 1) : ''}`, origin: c.map(R3), rotation: cleanEuler(R),
+				}));
+			});
+		}
+		const fitting = (pt, dir, label, scaleR, lenMul) => {
+			const R = matYTo(dir);
+			ngonBands(8, radius * scaleR, 22.5).forEach((b, i) => {
+				const Ri = matMul(R, eulerToMat([0, b.angle, 0]));
+				specs.push(Object.assign(boxAround(pt, [b.radial, Math.max(0.2, radius * lenMul - i * 0.05), b.tangent]), {
+					name: `${name}_${label}_${i + 1}`, origin: pt.map(R3), rotation: cleanEuler(Ri),
+				}));
+			});
+		};
+		for (let j = 1; j < pts.length - 1; j++) {
+			if (joints === 'none') continue;
+			const bent = vecDot(segDirs[j - 1], segDirs[j]) < 0.999;
+			if (joints === 'box' && bent) {
+				const s2 = radius * 2.5;
+				const R = matYTo(segDirs[j - 1]);
+				specs.push(Object.assign(boxAround(pts[j], [s2, s2, s2]), { name: `${name}_joint${j}`, origin: pts[j].map(R3), rotation: cleanEuler(R) }));
+			} else {
+				fitting(pts[j], segDirs[j - 1], `joint${j}`, 1.3, bent ? 2.6 : 1.2);
+			}
+		}
+		if (p.flanges !== false) {
+			fitting(pts[0], segDirs[0], 'flange_start', 1.4, 0.7);
+			fitting(pts[pts.length - 1], segDirs[segDirs.length - 1], 'flange_end', 1.4, 0.7);
+		}
+		Undo.initEdit({ outliner: true, elements: [] });
+		let holder = parent;
+		if (p.bone || (p.bone !== false && !parent && Format.animation_mode)) holder = makeBone(name, pts[0], parent);
+		const cubes = specsToCubes(holder, specs, numOr(p.inflate, 0));
+		Undo.finishEdit('MCP: add pipe');
+		Canvas.updateAll();
+		const res = generatedReport(cubes, { segments: pts.length - 1, sides, length: R3(pts.slice(1).reduce((s, q, i) => s + Math.hypot(q[0] - pts[i][0], q[1] - pts[i][1], q[2] - pts[i][2]), 0)) }, 6);
+		return reportZFighting(res, cubes, 'Move one of the points by >=0.05.', p);
+	},
+
+	/**
+	 * A ring of panels flaring from a top ring to a bottom ring: skirts, dresses,
+	 * capes (with arc), lampshades, bells, cone roofs, funnels, tutus, armour
+	 * faulds. Panels are tilted to the slope and turned to face outward, so the
+	 * result is a continuous round shell instead of a box.
+	 */
+	add_flare(p) {
+		requireProject();
+		p = p || {};
+		const center = num3(maybeParse(p.center), [0, 12, 0]);
+		const two = (v, fb) => {
+			const x = maybeParse(v);
+			if (Array.isArray(x)) return [numOr(x[0], fb), numOr(x[1] != null ? x[1] : x[0], fb)];
+			const n = numOr(x, fb);
+			return [n, n];
+		};
+		const rTop = two(p.top_radius, 4);
+		const rBot = two(p.bottom_radius, 6);
+		const height = numOr(p.height, 6);
+		if (!(height > 0)) throw new Error('height must be greater than 0 (the flare hangs DOWN from center by this much).');
+		const segments = Math.max(3, Math.min(64, Math.round(numOr(p.segments, 12))));
+		const arc = Math.max(10, Math.min(360, numOr(p.arc_degrees, 360)));
+		const named = { right: 0, back: 90, left: 180, front: 270 };
+		let start;
+		if (p.start_degrees != null) start = Number(p.start_degrees);
+		else {
+			const ac = p.arc_center != null ? (named[String(p.arc_center).toLowerCase()] != null ? named[String(p.arc_center).toLowerCase()] : Number(p.arc_center)) : 90;
+			start = ac - arc / 2;
+		}
+		const thickness = numOr(p.thickness, 0.6);
+		const overlap = numOr(p.overlap, 1.12);
+		const pleat = numOr(p.pleat, 0);
+		const rows = Math.max(1, Math.min(8, Math.round(numOr(p.rows, 1))));
+		const profile = String(p.profile || 'linear');
+		const f = profile === 'bell' ? (t) => 1 - (1 - t) * (1 - t) : profile === 'flare' ? (t) => t * t : (t) => t;
+		const name = p.name || 'flare';
+		const parent = resolveParent(p.parent);
+		const specs = [];
+		for (let i = 0; i < segments; i++) {
+			const th = (start + (i + 0.5) * arc / segments) * Math.PI / 180;
+			const cs = Math.cos(th), sn = Math.sin(th);
+			const pleatOff = pleat ? (i % 2 ? pleat / 2 : -pleat / 2) : 0;
+			for (let k = 0; k < rows; k++) {
+				const t0 = k / rows, t1 = (k + 1) / rows;
+				const r0 = [rTop[0] + (rBot[0] - rTop[0]) * f(t0), rTop[1] + (rBot[1] - rTop[1]) * f(t0)];
+				const r1 = [rTop[0] + (rBot[0] - rTop[0]) * f(t1), rTop[1] + (rBot[1] - rTop[1]) * f(t1)];
+				const P0 = [center[0] + r0[0] * cs, center[1] - t0 * height, center[2] + r0[1] * sn];
+				const P1 = [center[0] + r1[0] * cs, center[1] - t1 * height, center[2] + r1[1] * sn];
+				const out = vecNorm([cs / Math.max(0.01, (r0[0] + r1[0]) / 2) * ((r0[0] + r1[0]) / 2), 0, sn]);
+				const M = [(P0[0] + P1[0]) / 2 + out[0] * pleatOff, (P0[1] + P1[1]) / 2, (P0[2] + P1[2]) / 2 + out[2] * pleatOff];
+				const rmx = (r0[0] + r1[0]) / 2, rmz = (r0[1] + r1[1]) / 2;
+				let tng = vecNorm([-rmx * sn, 0, rmz * cs]);
+				const s = [P0[0] - P1[0], P0[1] - P1[1], P0[2] - P1[2]];
+				const slant = Math.hypot(s[0], s[1], s[2]);
+				const u = vecScale(s, 1 / slant);
+				// Local +Z faces outward, local +Y up the slope.
+				const n = vecNeg(vecNorm(vecCross(tng, u)));
+				tng = vecCross(u, n);
+				const R = [[tng[0], u[0], n[0]], [tng[1], u[1], n[1]], [tng[2], u[2], n[2]]];
+				const rho = Math.hypot(rmx * cs, rmz * sn);
+				const width = 2 * rho * Math.sin(Math.PI * arc / 360 / segments) * overlap + Math.abs(pleat) * 0.6;
+				specs.push(Object.assign(boxAround(M, [Math.max(0.2, width), slant + (rows > 1 ? 0.15 : 0), thickness]), {
+					name: `${name}_${i + 1}${rows > 1 ? '_' + (k + 1) : ''}`, origin: M.map(R3), rotation: cleanEuler(R),
+				}));
+			}
+		}
+		Undo.initEdit({ outliner: true, elements: [] });
+		let holder = parent, bone = null;
+		if (p.bone !== false) { bone = makeBone(name, center, parent); holder = bone; }
+		const cubes = specsToCubes(holder, specs, numOr(p.inflate, 0));
+		Undo.finishEdit('MCP: add flare');
+		Canvas.updateAll();
+		const res = generatedReport(cubes, {
+			segments, rows, arc_degrees: arc, start_degrees: R3(start), bone: bone ? bone.name : null,
+			top_y: center[1], bottom_y: R3(center[1] - height),
+			note: 'Angles: 0 = the model\'s right (+X), 90 = back (+Z), 180 = left, 270 = front. A cape is arc_degrees ~200 with arc_center "back". Paint it with detail_cubes {materials:[{match:"' + name + '", material:"cloth", pattern:[...]}]}.',
+		}, 4);
+		return reportZFighting(res, cubes, 'Raise overlap a little or add pleat 0.1-0.3 so neighbouring panels sit at different depths.', p);
+	},
+
+	/**
+	 * Hair around a head cube: a cap (top, sides, back, hairline), tapered bangs,
+	 * side locks, long back strands, tails on their own bones, an ahoge, a bun or
+	 * spikes — all named hair_* (ties: ribbon_*) so the paint engine shades them
+	 * with strands and a shine band.
+	 */
+	add_hair(p) {
+		requireProject();
+		p = p || {};
+		let head = findElement(p.head || 'head');
+		if (head instanceof Group) {
+			const kids = head.children.filter((c) => c instanceof Cube);
+			head = kids.sort((a, b) => cubeWorldInfo(b).volume - cubeWorldInfo(a).volume)[0] || null;
+		}
+		if (!head || !(head instanceof Cube)) throw new Error(`head: no cube "${p.head || 'head'}". Pass the name of the head CUBE (the skull box the hair wraps).`);
+		const styleName = String(p.style || 'short').toLowerCase();
+		const style = HAIR_STYLES[styleName];
+		if (!style) throw new Error(`Unknown style "${p.style}". Use ${Object.keys(HAIR_STYLES).join(', ')}.`);
+		const warnings = [];
+		if (head.rotation && head.rotation.some((r) => Math.abs(r) > 0.01)) warnings.push('The head cube itself is rotated; hair is built in its bone\'s frame, ignoring that rotation. Rotate the head BONE instead.');
+		const box = cubeLocalBox(head);
+		const [x0, y0, z0] = box.min, [x1, y1, z1] = box.max;
+		const W = x1 - x0, H = y1 - y0, D = z1 - z0;
+		const v = numOr(p.volume, Math.max(0.6, Math.round(W * 0.12 * 4) / 4));
+		const name = p.name || 'hair';
+		const rnd = makeRandom(p.seed != null ? p.seed : 7);
+		const parent = p.parent ? resolveParent(p.parent) : (head.parent && head.parent !== 'root' ? head.parent : null);
+		const lengthWords = { none: 0, jaw: 0, chin: 0.5, neck: H * 0.45, shoulder: H * 0.85, shoulders: H * 0.85, back: H * 1.7, waist: H * 2.5, hips: H * 2.9 };
+		let back = style.back;
+		if (p.length != null) back = typeof p.length === 'string' && !isFinite(Number(p.length)) ? (lengthWords[p.length.toLowerCase()] != null ? lengthWords[p.length.toLowerCase()] : style.back) : Number(p.length);
+		const sideFrac = p.sides != null ? Number(p.sides) : (back > H * 0.6 ? -0.2 : style.sides);
+		const bangs = String(p.bangs || style.bangs);
+		const bangLen = numOr(p.bang_length, 0.42);
+		const specs = [];
+		const bandH = Math.max(1, R3(H * 0.14));
+		// 1) cap
+		specs.push({ name: `${name}_top`, from: [x0 - v, y1, z0 - v * 0.6], to: [x1 + v, y1 + v, z1 + v] });
+		if (p.crown !== false) specs.push({ name: `${name}_crown`, from: [x0 + W * 0.14, y1 + v - 0.05, z0 + D * 0.08], to: [x1 - W * 0.14, y1 + v + Math.max(0.35, v * 0.45), z1 - D * 0.02] });
+		const sideBottom = y0 + H * sideFrac;
+		specs.push({ name: `${name}_side_right`, from: [x1, sideBottom, z0 - v * 0.4], to: [x1 + v, y1, z1] });
+		specs.push({ name: `${name}_side_left`, from: [x0 - v, sideBottom, z0 - v * 0.4], to: [x0, y1, z1] });
+		const backBottom = back > 0 ? y0 - Math.min(back, H * 0.3) : y0 + H * Math.max(0.05, sideFrac);
+		specs.push({ name: `${name}_back`, from: [x0 - v, backBottom, z1], to: [x1 + v, y1, z1 + v] });
+		specs.push({ name: `${name}_hairline`, from: [x0 - v * 0.5, y1 - bandH, z0 - v * 0.6], to: [x1 + v * 0.5, y1 + 0.2, z0 + 0.4] });
+		// 2) bangs
+		if (bangs !== 'none') {
+			const n = Math.max(3, Math.round(numOr(p.bang_count, (W + v) / 1.6)));
+			const span0 = x0 - v * 0.35, span1 = x1 + v * 0.35;
+			const sw = (span1 - span0) / n;
+			const depth = Math.max(0.5, Math.min(v, 1.2));
+			const topY = y1 - bandH * 0.4;
+			for (let i = 0; i < n; i++) {
+				const cx = span0 + sw * (i + 0.5);
+				const edge = Math.min(1, Math.abs(cx - (x0 + x1) / 2) / (W / 2));
+				let len = H * bangLen;
+				if (bangs !== 'straight') len *= (0.82 + 0.3 * rnd()) * (1 + 0.22 * edge);
+				if (bangs === 'parted' && edge < 0.25) len *= 0.72;
+				let tilt = 0;
+				if (bangs === 'swept') tilt = 12 + rnd() * 8;
+				else if (bangs === 'parted') tilt = (cx >= (x0 + x1) / 2 ? 1 : -1) * (5 + 11 * edge);
+				else if (bangs === 'spiky') tilt = (i % 2 ? 1 : -1) * (5 + 9 * rnd());
+				const stagger = 0.09 * (i % 3);
+				const zf = z0 - depth - stagger;
+				const taper = bangs === 'straight' ? [[1, 1]] : [[1, 0.5], [0.66, 0.3], [0.34, 0.2]];
+				let y = topY;
+				taper.forEach(([wf, lf], k) => {
+					const h = len * lf;
+					const w = sw * 1.22 * wf;
+					specs.push({
+						name: `${name}_bang${i + 1}_${k + 1}`,
+						from: [cx - w / 2, y - h, zf + k * 0.08], to: [cx + w / 2, y + (k ? 0.2 : 0), z0 + 0.3 - k * 0.08 - stagger * 0.5],
+						origin: [cx, topY, z0].map(R3), rotation: [0, 0, R3(tilt)],
+					});
+					y -= h;
+				});
+			}
+		}
+		// 3) side locks framing the face
+		if (p.sidelocks != null ? p.sidelocks : style.sidelocks) {
+			const lockLen = numOr(p.sidelock_length, H * 0.78 + (back > H * 0.6 ? H * 0.35 : 0));
+			[['right', 1], ['left', -1]].forEach(([side, sg]) => {
+				const cx = sg > 0 ? x1 + v * 0.3 : x0 - v * 0.3;
+				const w = Math.max(1, v * 1.35);
+				const top = y1 - bandH;
+				let y = top;
+				[[1, 0.55], [0.7, 0.28], [0.38, 0.17]].forEach(([wf, lf], k) => {
+					const h = lockLen * lf;
+					specs.push({
+						name: `${name}_sidelock_${side}_${k + 1}`,
+						from: [cx - w * wf / 2, y - h, z0 - v * 0.75 + k * 0.08], to: [cx + w * wf / 2, y + (k ? 0.2 : 0), z0 + Math.min(D * 0.35, 2.5) - k * 0.08],
+						origin: [cx, top, z0].map(R3), rotation: [0, 0, R3(sg * 4)],
+					});
+					y -= h;
+				});
+			});
+		}
+		// 4) long back hair
+		if (back > 0.4) {
+			const n = Math.max(3, Math.round((W + 2 * v) / 1.8));
+			const span0 = x0 - v, span1 = x1 + v;
+			const sw = (span1 - span0) / n;
+			const top = y0 + H * 0.4;
+			for (let i = 0; i < n; i++) {
+				const cx = span0 + sw * (i + 0.5);
+				const len = (y0 - top) * -1 + back * (0.85 + 0.3 * rnd());
+				const edge = Math.abs(cx - (x0 + x1) / 2) / ((W + 2 * v) / 2);
+				const stagger = 0.07 * (i % 4) + 0.02 * rnd();
+				const tiltX = -(3 + 4 * rnd());
+				const tiltZ = (cx >= (x0 + x1) / 2 ? 1 : -1) * 5 * edge;
+				let y = top;
+				[[1, 0.72], [0.62, 0.28]].forEach(([wf, lf], k) => {
+					const h = len * lf;
+					const w = sw * 1.25 * wf;
+					specs.push({
+						name: `${name}_long${i + 1}_${k + 1}`,
+						from: [cx - w / 2, y - h, z1 - 0.3 + stagger + k * 0.08], to: [cx + w / 2, y + (k ? 0.2 : 0), z1 + v + stagger - k * 0.08],
+						origin: [cx, top, z1].map(R3), rotation: [R3(tiltX), 0, R3(tiltZ)],
+					});
+					y -= h;
+				});
+			}
+		}
+		// 5) bun / spikes
+		if (p.bun != null ? p.bun : style.bun) {
+			const bs = Math.max(2, R3(H * 0.4));
+			specs.push({ name: `${name}_bun`, from: [-bs / 2 + (x0 + x1) / 2, y1 - bs * 0.2, z1 - bs * 0.1], to: [bs / 2 + (x0 + x1) / 2, y1 + bs * 0.8, z1 + bs * 0.9] });
+		}
+		const spikes = Math.round(numOr(p.spikes, style.spikes || 0));
+		for (let j = 0; j < spikes; j++) {
+			const a = (j / Math.max(1, spikes - 1) - 0.5) * 2;
+			const dir = vecNorm([a * 0.9, 0.85, 0.55 + 0.3 * rnd()]);
+			const base = [(x0 + x1) / 2 + a * W * 0.4, y1 + v * 0.3, (z0 + z1) / 2 + D * 0.15];
+			const R = matYTo(dir);
+			const L = H * (0.35 + 0.15 * rnd());
+			const w = Math.max(1, W * 0.22);
+			[[1, 0.55], [0.6, 0.3], [0.28, 0.15]].reduce((acc, [wf, lf], k) => {
+				const h = L * lf;
+				const c = [base[0] + dir[0] * (acc + h / 2), base[1] + dir[1] * (acc + h / 2), base[2] + dir[2] * (acc + h / 2)];
+				specs.push(Object.assign(boxAround(c, [w * wf, h + 0.2, w * wf * 0.8]), { name: `${name}_spike${j + 1}_${k + 1}`, origin: c.map(R3), rotation: cleanEuler(R) }));
+				return acc + h;
+			}, 0);
+		}
+
+		Undo.initEdit({ outliner: true, elements: [] });
+		const pivot = parent && parent.origin ? parent.origin.slice() : [(x0 + x1) / 2, y0, (z0 + z1) / 2];
+		const bone = makeBone(name, pivot, parent);
+		const cubes = specsToCubes(bone, specs, 0);
+		Undo.finishEdit('MCP: add hair');
+		// 6) tails on bone chains (they swing)
+		const tails = p.tails != null ? toList(maybeParse(p.tails)).map(maybeParse) : style.tails;
+		const tailOut = [];
+		for (const t of tails) {
+			const side = String(t.side || 'back').toLowerCase();
+			const hy = typeof t.height === 'number' ? t.height : t.height === 'low' ? y0 + H * 0.2 : t.height === 'mid' ? y0 + H * 0.55 : y1 - H * 0.1;
+			const size = numOr(t.size, Math.max(1.5, R3(H * 0.32)));
+			const len = numOr(t.length, H * 1.3);
+			const segs = Math.max(2, Math.min(10, Math.round(numOr(t.segments, 5))));
+			const up = String(t.direction || 'down') === 'up';
+			let base, baseRot, curve;
+			const highUp = up && hy >= y1 - H * 0.15;
+			if (side !== 'back' && highUp) {
+				// High side tails grow out of the TOP of the head near its corners (anime
+				// twin tufts) — starting on the side would bury their base in the side hair.
+				const sg = side === 'right' ? 1 : -1;
+				base = [sg * (W * 0.34) + (x0 + x1) / 2, y1 + v * 0.55, (z0 + z1) / 2 + D * 0.12];
+				baseRot = [16, 0, -sg * 44];
+				curve = [6, 0, -sg * 12];
+			} else if (side === 'back') {
+				base = [(x0 + x1) / 2, hy, z1 + v * 0.6];
+				baseRot = up ? [35, 0, 0] : [-22, 0, 0];
+				curve = up ? [14, 0, 0] : [5, 0, 0];
+			} else {
+				const sg = side === 'right' ? 1 : -1;
+				base = [sg > 0 ? x1 + v * 0.6 : x0 - v * 0.6, hy, (z0 + z1) / 2 + D * 0.12];
+				baseRot = up ? [0, 0, -sg * 38] : [0, 0, sg * 24];
+				curve = up ? [0, 0, -sg * 16] : [0, 0, -sg * 6];
+			}
+			if (t.base_rotation) baseRot = num3(maybeParse(t.base_rotation), baseRot);
+			if (t.curl != null) curve = curve.map((c) => (c ? Math.sign(c) * Math.abs(Number(t.curl)) : 0));
+			const chain = commands.extrude_chain({
+				segments: segs, base_origin: base.map(R3), segment_length: R3(len / segs),
+				initial_size: [size, R3(size * 0.85)], taper: numOr(t.taper, 0.72), direction: up ? 'up' : 'down',
+				base_rotation: baseRot, curvature: curve, name: `${name}_tail_${side}`, parent: bone.uuid, fix_z_fighting: false,
+			});
+			tailOut.push({ side, bones: chain.bones.map((b) => b.name), tip: chain.tip });
+			chain.bones.length && cubes.push(...Cube.all.filter((c) => c.name.startsWith(`${name}_tail_${side}`)));
+			// The tail's first bone carries the ribbon and the extra strands, so they swing with it.
+			const firstName = chain.bones[0] && chain.bones[0].name;
+			const tailBone = (firstName && Group.all.find((g) => g.name === firstName)) || bone;
+			const segLen = len / segs, dirY = up ? 1 : -1;
+			// Extra locks fanning out of the same root: a spiky tuft instead of one horn.
+			// They spread all around the main lock (out, in, forward, back), mirrored per
+			// side so the two tails are twins.
+			const strands = Math.max(1, Math.min(5, Math.round(numOr(t.strands, 1))));
+			const sgT = side === 'left' ? -1 : 1;
+			for (let k = 1; k < strands; k++) {
+				const az = ((k - 1) / Math.max(1, strands - 1)) * Math.PI * 2 + 0.6;
+				const tilt = 15 + 7 * ((k - 1) % 2);
+				commands.extrude_chain({
+					segments: Math.max(2, segs - 1), base_origin: base.map(R3), segment_length: R3((len * (0.84 - 0.07 * k)) / Math.max(2, segs - 1)),
+					initial_size: [R3(size * 0.62), R3(size * 0.55)], taper: numOr(t.taper, 0.72), direction: up ? 'up' : 'down',
+					base_rotation: [R3(Math.cos(az) * tilt), 0, R3(Math.sin(az) * tilt * sgT)], curvature: curve.map((c) => R3(c * 0.8)),
+					name: `${name}_tail_${side}_lock${k}`, parent: tailBone.uuid, create_bones: false, fix_z_fighting: false,
+				});
+				cubes.push(...Cube.all.filter((c) => c.name.startsWith(`${name}_tail_${side}_lock${k}`)));
+			}
+			if (t.ribbon !== false) {
+				// A band wrapping the root of the tail (in the tail bone's frame, so it follows the tilt).
+				const bandC = [base[0], base[1] + dirY * segLen * 0.18, base[2]];
+				const bw = size * 1.14, bd = size * 0.85 * 1.14;
+				const rib = createCubeIn(tailBone, Object.assign(boxAround(bandC.map(R3), [R3(bw), R3(Math.max(0.5, segLen * 0.24)), R3(bd)]), { name: `ribbon_${side}` }));
+				cubes.push(rib);
+				if (t.ribbon === 'bow' || t.bow) {
+					// Two loops and a knot on the visible side of the band: front for side tails, back for a back tail.
+					const zs = side === 'back' ? 1 : -1;
+					const face = bandC[2] + zs * (bd / 2 + 0.12);
+					const lw = R3(size * 0.78), lh = R3(size * 0.62);
+					const knot = [bandC[0], bandC[1], face];
+					cubes.push(createCubeIn(tailBone, Object.assign(boxAround(knot.map(R3), [R3(size * 0.32), R3(size * 0.36), 0.3]), { name: `ribbon_${side}_knot` })));
+					for (const [suffix, sx] of [['a', -1], ['b', 1]]) {
+						const c = [bandC[0] + sx * lw * 0.55, bandC[1] + size * 0.06, face - zs * 0.04];
+						cubes.push(createCubeIn(tailBone, Object.assign(boxAround(c.map(R3), [lw, lh, 0.24]), {
+							name: `ribbon_${side}_bow_${suffix}`, origin: knot.map(R3), rotation: [0, 0, -sx * 16],
+						})));
+					}
+				}
+			}
+		}
+		if (p.ahoge) {
+			commands.extrude_chain({
+				segments: 3, base_origin: [R3(x0 + W * 0.55), R3(y1 + v - 0.3), R3(z0 + D * 0.35)], segment_length: R3(H * 0.17),
+				initial_size: [Math.max(0.5, R3(v * 0.8)), Math.max(0.5, R3(v * 0.5))], taper: 0.6, direction: 'up',
+				base_rotation: [-20, 0, 8], curvature: [-28, 0, 0], name: `${name}_ahoge`, parent: bone.uuid, create_bones: false, fix_z_fighting: false,
+			});
+			cubes.push(...Cube.all.filter((c) => c.name.startsWith(`${name}_ahoge`)));
+		}
+		Canvas.updateAll();
+		const res = generatedReport(cubes, {
+			style: styleName, bone: bone.name, head: head.name, volume: v, bangs, back_length: R3(back), tails: tailOut,
+			next: `Paint with detail_cubes {materials:[{match:"^${name}", material:"hair", color:"<hair colour>"}, {match:"ribbon", material:"cloth", color:"<ribbon colour>"}, ...]}. The bangs hang ${Math.round(bangLen * 100)}% down the face; if they cover the eyes lower bang_length, then paint_face.`,
+		}, 6);
+		if (warnings.length) res.warnings = warnings;
+		return reportZFighting(res, cubes, 'Raise volume a little or change bang_count.', p);
+	},
+
+	/**
+	 * Loop-perfect mechanical motion: spinning gears (driven gears get the right
+	 * ratio and direction from their teeth), pistons sliding, levers swinging,
+	 * lights pulsing. Spins are keyed every quarter turn so every exporter
+	 * (GeckoLib, Bedrock, glTF) plays them the same.
+	 */
+	animate_mechanism(p) {
+		requireProject();
+		if (typeof Animation === 'undefined') throw new Error('Animations are not supported in this format.');
+		p = p || {};
+		const parts = toList(maybeParse(p.parts)).map(maybeParse);
+		if (!parts.length) throw new Error('parts (array) is required, e.g. [{bone:"gear_a", type:"spin", turns:1}, {bone:"gear_b", driven_by:"gear_a"}].');
+		let length = numOr(p.length, 2);
+		if (!(length > 0)) throw new Error('length must be greater than 0.');
+		const reg = gearRegistry();
+		const byBone = {};
+		parts.forEach((pt) => { if (!pt.bone) throw new Error('every part needs a `bone`.'); byBone[pt.bone] = pt; });
+		const turnsOf = {};
+		const resolveTurns = (pt, depth) => {
+			if (turnsOf[pt.bone] != null) return turnsOf[pt.bone];
+			if (depth > 32) throw new Error('driven_by forms a loop.');
+			if (pt.driven_by) {
+				const drv = byBone[pt.driven_by];
+				if (!drv) throw new Error(`"${pt.bone}": driven_by "${pt.driven_by}" must also be listed in parts.`);
+				const tD = resolveTurns(drv, depth + 1);
+				const link = String(pt.link || 'mesh');
+				const gA = reg[pt.driven_by], gB = reg[pt.bone];
+				let ratio = pt.ratio != null ? Number(pt.ratio) : (link === 'shaft' ? 1 : (gA && gB ? gA.teeth / gB.teeth : 1));
+				turnsOf[pt.bone] = tD * ratio * (link === 'mesh' ? -1 : 1);
+			} else {
+				turnsOf[pt.bone] = pt.turns != null ? Number(pt.turns) : pt.rpm != null ? Number(pt.rpm) * length / 60 : 1;
+			}
+			return turnsOf[pt.bone];
+		};
+		parts.forEach((pt) => { if (pt.driven_by || String(pt.type || 'spin') === 'spin') resolveTurns(pt, 0); });
+		const isInt = (x) => Math.abs(x - Math.round(x)) < 1e-3;
+		let mult = 1;
+		const spins = Object.keys(turnsOf).map((k) => turnsOf[k]);
+		if (p.fit_loop !== false && spins.some((t) => !isInt(t))) {
+			for (let m = 2; m <= 24; m++) if (spins.every((t) => isInt(t * m))) { mult = m; break; }
+			if (mult > 1) { length *= mult; Object.keys(turnsOf).forEach((k) => { turnsOf[k] *= mult; }); }
+		}
+		const list = [];
+		const notes = [];
+		for (const pt of parts) {
+			const g = findGroup(pt.bone);
+			if (!g) throw new Error(`Bone "${pt.bone}" not found. Mechanisms move BONES (add_gear makes one per gear; give other moving parts a group with its origin on the pivot).`);
+			const type = pt.driven_by ? 'spin' : String(pt.type || 'spin').toLowerCase();
+			const axis = axisName(pt.axis || (reg[pt.bone] && reg[pt.bone].axis) || (type === 'slide' ? 'y' : 'y'));
+			const ai = AXIS_INDEX[axis];
+			const freq = Math.max(1, Math.round(numOr(pt.frequency, 1))) * mult;
+			const phase = numOr(pt.phase, 0);
+			const vec = (v) => { const out = [0, 0, 0]; out[ai] = R3(v); return out; };
+			if (type === 'spin') {
+				const turns = turnsOf[pt.bone];
+				const n = Math.max(4, Math.ceil(Math.abs(turns) * 4));
+				for (let j = 0; j <= n; j++) list.push({ bone: pt.bone, channel: 'rotation', time: R3(length * j / n), value: vec(360 * turns * j / n), interpolation: 'linear' });
+			} else {
+				const samples = Math.max(8, freq * 8);
+				for (let j = 0; j <= samples; j++) {
+					const t = j / samples;
+					const w = 2 * Math.PI * (freq * t + phase);
+					let channel = 'rotation', value;
+					if (type === 'slide' || type === 'piston') {
+						channel = 'position';
+						value = vec(numOr(pt.distance, 1) * (0.5 - 0.5 * Math.cos(w)));
+					} else if (type === 'swing' || type === 'rock' || type === 'lever') {
+						value = vec(numOr(pt.angle, 20) * Math.sin(w));
+					} else if (type === 'bob' || type === 'hover') {
+						channel = 'position';
+						value = [0, R3(numOr(pt.distance, 0.5) * Math.sin(w)), 0];
+					} else if (type === 'pulse') {
+						channel = 'scale';
+						const sc = 1 + numOr(pt.amount, 0.08) * Math.sin(w);
+						value = [R3(sc), R3(sc), R3(sc)];
+					} else if (type === 'vibrate' || type === 'shake') {
+						channel = 'position';
+						value = vec(numOr(pt.distance, 0.08) * Math.sin(w * 4));
+					} else {
+						throw new Error(`Unknown part type "${type}". Use spin, slide, swing, bob, pulse or vibrate.`);
+					}
+					list.push({ bone: pt.bone, channel, time: R3(length * t), value, interpolation: 'catmullrom' });
+				}
+			}
+		}
+		const baseName = (Project.name || 'model').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'model';
+		const name = p.name || `animation.${baseName}.${p.state || 'working'}`;
+		let anim = findAnimation(name);
+		if (anim && p.replace !== false) { anim.remove(true); anim = null; }
+		Undo.initEdit({ animations: [], keyframes: [] });
+		if (!anim) anim = new Animation({ name, loop: p.loop || 'loop', length }).add();
+		anim.select();
+		const res = putKeyframes(anim, list);
+		anim.setLength(length);
+		anim.loop = p.loop || 'loop';
+		Undo.finishEdit('MCP: animate mechanism');
+		if (typeof updateKeyframeSelection === 'function') updateKeyframeSelection();
+		if (mult > 1) notes.push(`Gear ratios made the turns fractional, so the loop was stretched ${mult}x (to ${R3(length)}s) to close seamlessly.`);
+		return {
+			animation: name, length: R3(length), loop_multiplier: mult,
+			turns_per_loop: Object.fromEntries(Object.keys(turnsOf).map((k) => [k, R3(turnsOf[k])])),
+			keyframes: res.created.length, missing: res.missing, notes,
+			next: 'preview_animation to see it, then request_review.',
+		};
+	},
+
+	/**
+	 * Zoom into part of a reference (a face, a buckle, a hem) so small details
+	 * can be read instead of guessed. rect is [x, y, w, h] in 0-1 fractions of
+	 * the image (or pixels of the original).
+	 */
+	async zoom_reference(p) {
+		p = p || {};
+		const ref = pickReference(p.reference);
+		if (!ref) throw new Error('No reference loaded. Drop an image into the MCP Copilot panel or call load_reference / find_references first.');
+		const rr = maybeParse(p.rect);
+		if (!Array.isArray(rr) || rr.length !== 4) throw new Error('rect [x, y, w, h] is required (fractions 0-1 of the image, e.g. [0.35, 0.05, 0.3, 0.25] for a face).');
+		const W = ref.width, H = ref.height;
+		const norm = rr.every((v) => v <= 1.0001);
+		const sx = norm ? W : 1, sy = norm ? H : 1;
+		const x0 = Math.max(0, rr[0] * sx), y0 = Math.max(0, rr[1] * sy);
+		const cw = Math.max(1, Math.min(W - x0, rr[2] * sx)), ch = Math.max(1, Math.min(H - y0, rr[3] * sy));
+		const full = await loadImageElement(ref.data_url);
+		const target = Math.max(128, Math.min(1024, numOr(p.size, 640)));
+		const scale = Math.min(12, target / Math.max(cw, ch));
+		const cv = document.createElement('canvas');
+		cv.width = Math.max(1, Math.round(cw * scale)); cv.height = Math.max(1, Math.round(ch * scale));
+		const cx = cv.getContext('2d');
+		cx.imageSmoothingEnabled = scale < 2.5;
+		cx.drawImage(full, x0, y0, cw, ch, 0, 0, cv.width, cv.height);
+		return {
+			reference: ref.name, rect_px: [Math.round(x0), Math.round(y0), Math.round(cw), Math.round(ch)], zoom: R3(scale),
+			data_url: cv.toDataURL('image/png'),
+			next: 'Count what you see (lace loops, buttons, stripes) and size the geometry/texture details from it; make_palette with regions pointed here for exact colours.',
+		};
+	},
+
+	/**
+	 * Build the model's colour palette. From a reference/concept image: colour
+	 * families (background removed, light+shadow of the same material merged)
+	 * each with a 5-step hue-shifted ramp, optionally tied to named regions you
+	 * point at. From a text brief: a harmony around a base colour / hue + mood,
+	 * or ramps for colours you name. Stored on the project, so texturing rules
+	 * can use color:"$hair" / "$hair.dark".
+	 */
+	async make_palette(p) {
+		p = p || {};
+		const out = {};
+		let entries = [];
+		const named = maybeParse(p.colors);
+		const regions = toList(maybeParse(p.regions || [])).map(maybeParse);
+		// Regions read the image even when `colors` adds named extras (eyes, a thin ribbon).
+		const useRef = p.source === 'reference' || (p.source !== 'text' && G.references.length &&
+			(regions.length || (!named && p.base_color == null && p.hue == null)));
+		if (useRef) {
+			const ref = pickReference(p.reference);
+			if (!ref) throw new Error('No reference loaded. Load one (load_reference / find_references) or pass colors / base_color for a text brief.');
+			const img = await imageDataFromSource(ref.data_url, 360);
+			const W = img.width, H = img.height;
+			out.reference = ref.name;
+			const toRect = (r) => {
+				const rr = maybeParse(r.rect || r.box || null);
+				if (Array.isArray(rr) && rr.length === 4) {
+					const norm = rr.every((v) => v <= 1.0001);
+					const sx = norm ? W : W / ref.width, sy = norm ? H : H / ref.height;
+					return [Math.round(rr[0] * sx), Math.round(rr[1] * sy), Math.round((rr[0] + rr[2]) * sx), Math.round((rr[1] + rr[3]) * sy)];
+				}
+				if (r.x != null && r.y != null) {
+					const norm = r.x <= 1.0001 && r.y <= 1.0001;
+					const cx = norm ? r.x * W : r.x * W / ref.width, cy = norm ? r.y * H : r.y * H / ref.height;
+					const rad = Math.max(2, Math.round(r.radius != null ? (r.radius <= 1 ? r.radius * Math.max(W, H) : r.radius * W / ref.width) : 0.02 * Math.max(W, H)));
+					return [Math.round(cx - rad), Math.round(cy - rad), Math.round(cx + rad), Math.round(cy + rad)];
+				}
+				throw new Error(`region "${r.name || '?'}": give rect:[x,y,w,h] or x,y — fractions 0-1 of the image (or pixels of the original).`);
+			};
+			if (regions.length) {
+				for (const r of regions) {
+					if (!r.name) throw new Error('every region needs a `name` (it becomes the palette key, e.g. "hair").');
+					const s = paletteSamples(img, toRect(r), true);
+					if (!s.points.length) { entries.push({ key: slugKey(r.name), error: 'no opaque pixels there' }); continue; }
+					const cl = kmeansLab(s.points, 3, 10).sort((a, b) => b.share - a.share);
+					// The material colour is the biggest cluster that is neither a specular
+					// highlight nor a line-art black (unless that is all there is).
+					// A dark cluster that covers most of the spot is a black garment, not ink.
+					const usable = cl.filter((c) => (c.lab[0] > 12 || c.share >= 0.45) && c.lab[0] < 94);
+					const main = (usable.length ? usable : cl)[0];
+					const shades = cl.slice().sort((a, b) => a.lab[0] - b.lab[0]).map((c) => rgbToHex(c.rgb));
+					entries.push(buildPaletteEntry(main.rgb, { key: slugKey(r.name), observed: shades, material_hint: r.material || undefined }));
+				}
+			}
+			if (!regions.length || p.include_auto) {
+				const s = paletteSamples(img, null, !!p.keep_background);
+				if (s.background) out.background_removed = s.background;
+				const k = Math.max(4, Math.min(20, Math.round(numOr(p.clusters, 14))));
+				const fams = familiesFromClusters(kmeansLab(s.points, k, 14), Math.max(2, Math.min(16, Math.round(numOr(p.count, 9)))));
+				const minShare = numOr(p.min_share, 0.012);
+				const used = new Set(entries.map((e) => e.key));
+				fams.filter((f) => f.share >= minShare).forEach((f) => {
+					const e = buildPaletteEntry(f.rgb, { share: R3(f.share), observed: f.observed });
+					let key = slugKey(e.name), n = 2;
+					while (used.has(key)) key = slugKey(e.name) + '_' + n++;
+					used.add(key);
+					e.key = key;
+					entries.push(e);
+				});
+			}
+			if (named && typeof named === 'object' && !Array.isArray(named)) {
+				// Named colours win over a region of the same key: too small to sample, or tinted by the scene light.
+				for (const k of Object.keys(named)) {
+					const e = buildPaletteEntry(hexToRgb(named[k]), { key: slugKey(k), observed: ['given'] });
+					const at = entries.findIndex((x) => x.key === e.key);
+					if (at >= 0) entries[at] = e; else entries.push(e);
+				}
+			}
+			out.next = regions.length
+				? 'Texture with color:"$key" / "$key.shadow" / "$key.light" in detail_cubes rules.'
+				: 'Name what each family is in the reference (hair, skin, skirt...) by calling make_palette again with regions:[{name:"hair", x:0.5, y:0.12}, ...] pointing at flat-lit spots — then color:"$hair" works in detail_cubes.';
+		} else {
+			// Text brief.
+			if (named && typeof named === 'object') {
+				const list = Array.isArray(named) ? named.map((c, i) => [`c${i + 1}`, c]) : Object.keys(named).map((k) => [k, named[k]]);
+				for (const [k, c] of list) {
+					const rgb = hexToRgb(c);
+					entries.push(buildPaletteEntry(rgb, { key: slugKey(k) }));
+				}
+			}
+			if (p.base_color != null || p.hue != null || !entries.length) {
+				const mood = PALETTE_MOODS[String(p.mood || 'neutral').toLowerCase()] || PALETTE_MOODS.neutral;
+				const scheme = PALETTE_SCHEMES[String(p.scheme || 'split').toLowerCase()];
+				if (!scheme) throw new Error(`scheme must be one of ${Object.keys(PALETTE_SCHEMES).join(', ')}.`);
+				let h0, s0 = mood.s, l0 = mood.l;
+				if (p.base_color != null) { const b = rgbToHsl(...hexToRgb(p.base_color)); h0 = b.h; s0 = b.s; l0 = b.l; }
+				else h0 = numOr(p.hue, 210);
+				const shiftWarm = (h) => (mood.warm ? hueToward(h, 35, 12) : mood.cool ? hueToward(h, 220, 12) : h);
+				scheme.forEach((dh, i) => {
+					const h = shiftWarm(h0 + dh);
+					const rgb = hslToRgb(h, Math.max(0, Math.min(1, s0 * (i ? 0.9 : 1))), Math.max(0.08, Math.min(0.92, l0 + (i ? (i % 2 ? 0.08 : -0.08) : 0))));
+					entries.push(buildPaletteEntry(rgb, { key: i === 0 ? 'main' : i === 1 ? 'secondary' : `accent${i - 1}` }));
+				});
+				// Every scheme needs neutrals to rest the eye: a warm-or-cool dark and light.
+				const darkN = hslToRgb(h0 + 200, 0.18, 0.16), lightN = hslToRgb(h0 + 30, 0.18, 0.86);
+				entries.push(buildPaletteEntry(darkN, { key: 'dark_neutral' }));
+				entries.push(buildPaletteEntry(lightN, { key: 'light_neutral' }));
+				out.scheme = p.scheme || 'split';
+				out.mood = p.mood || 'neutral';
+			}
+			out.next = 'Use the keys in detail_cubes rules: {match:"coat", material:"cloth", color:"$main"}, {match:"trim", color:"$accent1.light"}.';
+		}
+		entries = entries.filter((e) => !e.error || (out.errors = (out.errors || []).concat(`${e.key}: ${e.error}`), false));
+		if (!entries.length) throw new Error('No colours found. Point regions at opaque parts of the image, or pass colors.');
+		if (p.store !== false) storePalette(entries, p.name || out.reference || 'palette');
+		out.palette = entries.map((e) => {
+			const o = { key: e.key, name: e.name, base: e.base, ramp: e.ramp, material_hint: e.material_hint };
+			if (e.share != null) o.share = e.share;
+			if (e.observed) o.observed_shades = e.observed;
+			return o;
+		});
+		out.usage = 'Ramp = [deep shadow, shadow, BASE, light, highlight]. In rules use "$key" (base) or "$key.shadow" / "$key.light" / "$key.highlight" / "$key.deep".';
+		out.stored = p.store !== false;
+		const card = renderPaletteCard(entries, (out.reference ? 'palette of ' + out.reference : 'palette ' + (out.scheme || '')));
+		if (card) out.card_data_url = card;
+		return out;
+	},
+
+	/** The palette stored on this project (keys usable as "$key" colours). */
+	get_palette() {
+		requireProject();
+		const pal = Project.mcp_palette || {};
+		const keys = Object.keys(pal);
+		const entries = keys.map((k) => ({ key: k, base: pal[k].base, ramp: pal[k].ramp, name: colorName(hexToRgbPlain(pal[k].base)), material_hint: '' }));
+		return { name: Project.mcp_palette_name || null, count: keys.length, palette: entries, card_data_url: keys.length ? renderPaletteCard(entries, 'project palette') : null };
+	},
+
 	// ---- reference images & comparison ------------------------------------
 	// The grounded-modeling engine: keep the reference in the workspace and turn
 	// "does it match?" from an opinion into a measured number.
+
+	/**
+	 * Lay out search-result thumbnails as one numbered sheet, so choosing
+	 * references costs one image instead of a dozen. Used by find_references.
+	 */
+	async contact_sheet(p) {
+		const items = toList(maybeParse(p && p.images)).map(maybeParse).filter((x) => x && x.data_url);
+		if (!items.length) throw new Error('images: [{data_url, label}] is required.');
+		const cols = Math.max(1, Math.min(6, Math.round(numOr(p.columns, items.length <= 4 ? items.length : items.length <= 9 ? 3 : 4))));
+		const cell = Math.max(96, Math.min(320, Math.round(numOr(p.cell, 220))));
+		const capH = 30;
+		const rows = Math.ceil(items.length / cols);
+		const cv = document.createElement('canvas');
+		cv.width = cols * cell; cv.height = rows * (cell + capH);
+		const x = cv.getContext('2d');
+		x.fillStyle = '#15171c'; x.fillRect(0, 0, cv.width, cv.height);
+		for (let i = 0; i < items.length; i++) {
+			const it = items[i];
+			const cx = (i % cols) * cell, cy = Math.floor(i / cols) * (cell + capH);
+			try {
+				const img = await loadImageElement(it.data_url);
+				const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+				const k = Math.min((cell - 8) / w, (cell - 8) / h);
+				const dw = Math.round(w * k), dh = Math.round(h * k);
+				x.fillStyle = '#20232a'; x.fillRect(cx + 2, cy + 2, cell - 4, cell - 4);
+				x.drawImage(img, cx + (cell - dw) / 2, cy + (cell - dh) / 2, dw, dh);
+			} catch (e) {
+				x.fillStyle = '#5a2a2a'; x.fillRect(cx + 2, cy + 2, cell - 4, cell - 4);
+			}
+			x.fillStyle = 'rgba(0,0,0,0.75)'; x.fillRect(cx + 4, cy + 4, 34, 24);
+			x.fillStyle = '#ffd23f'; x.font = 'bold 18px monospace'; x.textBaseline = 'middle';
+			x.fillText(String(it.number != null ? it.number : i + 1), cx + 8, cy + 16);
+			x.fillStyle = '#cfd6e2'; x.font = '11px monospace';
+			const label = String(it.label || '');
+			x.fillText(label.slice(0, Math.floor(cell / 6.7)), cx + 4, cy + cell + 9);
+			x.fillText(label.slice(Math.floor(cell / 6.7), Math.floor(cell / 6.7) * 2), cx + 4, cy + cell + 22);
+		}
+		return { data_url: cv.toDataURL('image/png'), count: items.length, columns: cols };
+	},
 
 	async load_reference(p) {
 		let dataURL = p.data_url;
@@ -6395,12 +9858,16 @@ const commands = {
 		}
 		if (!dataURL) throw new Error('Provide a reference `path` (desktop) or `data_url`.');
 		const name = p.name || (p.path ? String(p.path).split(/[\\/]/).pop() : undefined);
-		const entry = await addReference(dataURL, name, p.path ? 'path' : 'data', p);
+		const entry = await addReference(dataURL, name, p.source_url ? 'url' : p.path ? 'path' : 'data', p);
+		if (p.source_url) entry.source_url = String(p.source_url);
+		const colors = await quickReferencePalette(entry);
 		return {
 			id: entry.id, name: entry.name,
 			width: entry.width, height: entry.height,
 			overlay_added: !!entry.overlay_added,
 			total_references: G.references.length,
+			colors,
+			next: 'get_reference to look at it; make_palette {regions:[{name:"hair", x:.., y:..}, ...]} to turn its colours into named ramps for texturing.',
 		};
 	},
 
@@ -6414,19 +9881,21 @@ const commands = {
 		};
 	},
 
-	get_reference(p) {
+	async get_reference(p) {
 		if (!G.references.length) {
-			return { count: 0, note: 'No reference loaded. Drop an image into the BlockbenchMCP panel, or call load_reference.' };
+			return { count: 0, note: 'No reference loaded. Drop an image into the BlockbenchMCP panel, call load_reference, or find_references to search the web.' };
 		}
 		const which = (p && (p.name != null || p.id != null)) ? pickReference(p.id != null ? p.id : p.name) : null;
 		const list = which ? [which] : G.references;
-		return {
-			count: list.length,
-			references: list.map((r) => ({
+		const out = [];
+		for (const r of list) {
+			out.push({
 				id: r.id, name: r.name, width: r.width, height: r.height, source: r.source,
+				source_url: r.source_url, colors: await quickReferencePalette(r),
 				data_url: r.data_url,
-			})),
-		};
+			});
+		}
+		return { count: out.length, references: out };
 	},
 
 	clear_references() {

@@ -80,18 +80,22 @@ There are two pieces:
 
 ## Features
 
-- 🧱 **Modeling.** Create bones (groups) and cubes one at a time or **in bulk** (`add_groups` / `add_cubes` build a whole posed skeleton in one call), with full rotation and inflate. Edit, move, reparent and delete elements, and read the outliner tree.
+- 🔎 **References from the web.** For a known character, creature, item, vehicle or product, `find_references` searches the web (safe search always on) and returns one numbered **contact sheet** plus a short description; `load_reference {result:N}` / `{url}` loads the chosen ones into Blockbench, and `zoom_reference` enlarges details like a face or a buckle.
+- 🎨 **Palettes.** `make_palette` reads a reference or concept image into named colour families, each with a 5-step hue-shifted ramp (or builds a harmony from a text brief), stores it on the project and lets texturing use `color:"$hair"` / `"$hair.shadow"`.
+- 🧱 **Modeling.** Create bones (groups) and cubes one at a time or **in bulk** (`add_groups` / `add_cubes` build a whole posed skeleton in one call), with full rotation and inflate. Place cubes by `center`+`size`, **`attach`** them to a face of another cube (they land on the surface and follow its rotation and bone, so nothing floats), or build both sides at once with **`mirror`**. Edit, move, reparent and delete elements, and read the outliner tree.
+- ⚙️ **Round shapes, mechanisms, cloth and hair.** `add_cylinder` (solid or tube, an exact regular polygon), `add_gear` (teeth, spokes, hub, axle; `mesh_with` places the next gear so the teeth interleave), `add_pipe`, `add_flare` (pleated skirts, capes, lampshades, roofs), `add_hair` (bangs, side locks, back strands, tails on bone chains with ribbons), and `animate_mechanism` (spinning gear trains with the right ratios and directions, pistons, levers, pulsing lights, seamless loops).
+- ✨ **No z-fighting.** Coplanar faces are detected in world space (rotations, bones and inflate included) and **fixed automatically** for everything a tool creates; `fix_z_fighting` cleans up after manual edits.
 - 🏗️ **Procedural detail.** An LLM cannot compute 200 sets of `[from,to]` in its head, so these tools do the math. `voxelize_matrix` extrudes a character matrix into cubes (draw a blade, an emblem or a horn profile as pixel art). `add_hollow_volume` builds a shell with a real cavity (hoods, helmets, pauldrons, cages). `generate_array` repeats an element along a line, ring or grid with jitter, taper, rotation and an anti-z-fighting depth stagger (torn hems, scales, plates, teeth, rivets). `extrude_chain` builds a tapering, curving chain with one bone per segment (horns, tails, tentacles, braids). `add_wing` builds a jointed wing with a membrane.
 - 📏 **Density gate.** `audit_complexity` grades the model against a cube budget (prop 30-60, mob 100-180, hero 180-300+) and reports monolithic boxes, overlap, micro-detail density, bare flat faces and bone depth. The verdict (`too_primitive` / `acceptable` / `high_detail`) stops a blockout from reaching texturing.
-- 🎨 **Texturing.** Create textures and paint procedurally: pixels, rects, lines, circles, **ellipses, polygons, dither, noise** and gradients. `detail_cubes` **auto-shades every cube face** so nothing is left flat or untextured, and `paint_faces` places features in **face-relative coordinates**.
+- 🖌️ **Texturing engine.** `detail_cubes` shades every pixel from its 3D point: hue-shifted light (cool shadows, warm lights), ambient occlusion, edge bevels and per-**material** detail (skin, cloth folds, hair strands with a shine band, metal sheen and scratches, wood grain, stone, leather stitching, scales, glowing emissive), plus world-space **patterns** that run across neighbouring cubes (plaid, stripes, panels with rivets, lace and trim borders, hazard, bricks…). `paint_face` draws eyes, brows, mouth and blush as pixel art in the face's own grid. `pack_uv` gives thin cubes per-face UV so every face gets real pixels. Low-level paint ops (pixels, rects, ellipses, polygons, dither, noise, gradients) and face-relative `paint_faces` are still there.
 - 🦴 **Rigging.** `create_rig` builds a segmented humanoid or quadruped skeleton with three bones per limb (so elbows and knees bend), joints on the real pivots and correct `*_left` / `*_right` naming. `check_rig` won't call a two-bone-limb rig animation-ready.
 - 🎬 **Animation.** `generate_animation` writes a complete base cycle (idle / walk / run / attack / cast / jump / hurt / death / fly) with correct gait phasing, bent joints, counter-rotation, follow-through and seamless loops. `add_keyframes` refines it in bulk with interpolation control.
 - 📐 **Measured animation.** `analyze_animation` evaluates the rig and reports how far each hand, foot and head travels in the model's own axes, whether the loop closes and whether lower limb segments move at all. This is how it catches an attack that swings into the model's back instead of at the target.
 - 🧭 **Left and right stay correct.** The model faces `-Z`, so its own right is `+X`. `get_orientation`, `which_side` and `check_sides` answer from coordinates. `add_cube` / `add_group` take `side:"left"|"right"` and **refuse** a call whose coordinate contradicts it, and every screenshot is labelled with which image edge is the model's right.
 - 🙋 **Human review gate.** `request_review` renders labelled views, shows them in the MCP Copilot panel and **blocks until you press a button**, then returns your verdict and comment inside the same tool call. `ask_user` does the same for a question.
 - 🎯 **Reference matching.** Drop a reference image into the **MCP Copilot panel**. `compare_reference` **scores the silhouette match** (IoU `match_percent` plus a `[reference | model | overlay]` composite and "add/trim mass here" advice), and `measure_model` gives numeric proportions.
-- 📸 **Vision.** `screenshot`, `screenshot_views` (several captioned angles at once) and `get_texture` return images inline so the AI can see its work and iterate. `check_model` audits for problems.
-- 🧠 **Guidance.** `get_guide` returns playbooks for modeling, detailing, orientation, rigging, texturing, VFX, animation, review and reference matching.
+- 📸 **Vision and close-up inspection.** `screenshot`, `screenshot_views` and `get_texture` return images inline. `check_model` audits for z-fighting, floating parts, hidden (buried) cubes, stretched UVs and side mistakes; `inspect_model` (and the close-ups `screenshot_views` appends) frames each problem spot, x-rays away what stands in front, outlines the cubes involved and captions the fix — then checks the face, hands, feet, joints and gear contacts, which four full-body views never show.
+- 🧠 **Guidance.** `get_guide` returns playbooks for modeling, characters, mechanisms, detailing, inspection, orientation, rigging, texturing, VFX, animation, review and reference matching, and the server sends its workflow (references first, palette, build, inspect) to the client on connect.
 - 🪟 **In-app panel.** The **MCP Copilot** side panel shows server status, the reference drop zone, a live log of the AI's commands, model stats, the last match score and any pending review.
 - 🧩 **Plugins.** Search, install (by store id, URL or file) and uninstall Blockbench plugins, so the AI can set up formats like GeckoLib itself.
 - 📦 **Export.** `export_project` uses the format's own codec. `export_model` writes through any named codec; the default is glTF, a self-contained `.gltf` that imports into Godot, Unity or Blender.
@@ -173,14 +177,14 @@ Point your client at `dist/index.js` over stdio, using an **absolute path**.
 | **Status & guidance** | `get_status`, `get_guide`, `list_formats` |
 | **Orientation (left/right)** | `get_orientation`, `which_side`, `check_sides` |
 | **Human review** | `request_review`, `ask_user` |
-| **Reference matching** | `get_reference`, `load_reference`, `compare_reference`, `measure_model`, `list_references`, `clear_references` |
+| **References & colour** | `find_references`, `get_reference`, `load_reference`, `zoom_reference`, `make_palette`, `get_palette`, `compare_reference`, `measure_model`, `list_references`, `clear_references` |
 | **Project** | `new_project`, `set_project_meta`, `save_project`, `export_project`, `export_model`, `load_project`, `close_project` |
 | **Geometry** | `add_group`, `add_cube`, `add_groups`, `add_cubes`, `add_plane`, `add_mesh`, `mirror_element`, `edit_element`, `delete_element`, `list_outliner`, `get_element`, `pack_uv` |
-| **Procedural detail** | `voxelize_matrix`, `add_hollow_volume`, `generate_array`, `extrude_chain`, `add_wing` |
-| **Quality gates** | `audit_complexity`, `check_model`, `check_sides`, `check_rig` |
+| **Procedural detail** | `voxelize_matrix`, `add_hollow_volume`, `generate_array`, `extrude_chain`, `add_wing`, `add_flare`, `add_hair`, `add_cylinder`, `add_gear`, `add_pipe` |
+| **Quality gates** | `audit_complexity`, `check_model`, `fix_z_fighting`, `inspect_model`, `check_sides`, `check_rig` |
 | **Rigging** | `create_rig`, `check_rig`, `get_rig` |
-| **UV & textures** | `create_texture`, `create_vfx_texture`, `paint_texture`, `detail_cubes`, `paint_faces`, `apply_texture`, `set_cube_uv`, `set_texture_render_mode`, `import_texture`, `resize_texture`, `list_textures`, `get_texture` |
-| **Animation** | `generate_animation`, `analyze_animation`, `preview_animation`, `create_animation`, `add_keyframe`, `add_keyframes`, `list_animations`, `remove_animation` |
+| **UV & textures** | `create_texture`, `create_vfx_texture`, `paint_texture`, `detail_cubes`, `paint_face`, `paint_faces`, `apply_texture`, `set_cube_uv`, `set_texture_render_mode`, `import_texture`, `resize_texture`, `list_textures`, `get_texture` |
+| **Animation** | `animate_mechanism`, `generate_animation`, `analyze_animation`, `preview_animation`, `create_animation`, `add_keyframe`, `add_keyframes`, `list_animations`, `remove_animation` |
 | **View** | `set_camera_angle`, `screenshot`, `screenshot_views` |
 | **Plugins** | `list_plugins`, `install_plugin`, `uninstall_plugin` |
 | **Escape hatch** | `execute_script` |
@@ -353,13 +357,15 @@ Harmless. Blockbench tries to fetch store metadata for the side-loaded plugin an
 
   It sends no CORS headers, so a page cannot read its responses either.
 - **Trust boundary: the MCP client.** Anything that controls the connected client, including a model steered by prompt injection from a file, web page or image it reads, can drive every tool.
+- **Web access is limited to images.** `find_references` / `load_reference {url}` run in the MCP server (not in Blockbench), force safe search, only fetch public `http(s)` addresses (localhost, LAN and link-local addresses are refused, including hostnames that resolve to them and every redirect hop), cap downloads at 15 MB and accept a file only if its bytes are a real PNG/JPEG/GIF/WebP/AVIF/BMP image.
 - `execute_script` runs **unsandboxed JavaScript** with Blockbench's full privileges. Only connect MCP clients you trust, and prefer the dedicated tools where possible. If you don't need it, turn off **Settings ▸ General ▸ Allow execute_script**. The command is then rejected inside Blockbench and every other tool keeps working.
 
 ## Limitations
 
 - **Desktop only.** The bridge relies on Node modules (`net`), which the Blockbench web app does not expose to plugins.
 - **One Blockbench window.** The bridge talks to whichever project is currently active.
-- Box-UV packing is up to the caller; `add_cube` returns resolved face UVs to make this manageable.
+- Formats with box UV only (e.g. Java entity / OptiFine) cannot give thin cubes their own pixels; `pack_uv` warns about them. Java block models only rotate one axis in 22.5° steps, so use 8 or 16 sides for round parts there.
+- `find_references` scrapes public image search pages; if an engine changes its markup it falls back to the next one.
 
 ## Development
 

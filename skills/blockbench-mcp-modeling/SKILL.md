@@ -1,6 +1,6 @@
 ---
 name: blockbench-mcp-modeling
-description: Build high-quality Minecraft / GeckoLib / Bedrock models, textures and animations in Blockbench through the BlockbenchMCP server (the mcp__blockbench__* tools). Use whenever the user asks to create, model, texture, rig, retexture or animate a creature, character, mob, weapon, prop or item in Blockbench, wants to match a reference image, or mentions the blockbench MCP. Encodes the cube-budget and layering doctrine, the procedural generators (voxelize_matrix, add_hollow_volume, generate_array, extrude_chain) and ready-to-paste execute_script snippets, so models come out at 100-300 cubes of real detail instead of 15 flat boxes.
+description: Build high-quality Minecraft / GeckoLib / Bedrock models, textures and animations in Blockbench through the BlockbenchMCP server (the mcp__blockbench__* tools). Use whenever the user asks to create, model, texture, rig, retexture or animate a creature, character, mob, weapon, prop or item in Blockbench, wants to match a reference image, or mentions the blockbench MCP. Encodes the references-first workflow (find_references web search, make_palette colour ramps), the cube-budget and layering doctrine, the shape tools (add_cubes attach/mirror, add_flare, add_hair, add_cylinder, add_gear, add_pipe, voxelize_matrix, add_hollow_volume, generate_array, extrude_chain), the material texturing engine and close-up inspection (inspect_model), so models come out as detailed, flicker-free, well-placed geometry instead of 15 flat boxes.
 ---
 
 # Blockbench MCP Modeling Operator Guide
@@ -25,13 +25,32 @@ The tools talk to a local server **inside** Blockbench. If a tool returns
 - The **MCP Copilot panel** is where the user drops a reference image, watches your activity
   log, and sees the live match score. If they mention a reference, call `get_reference`.
 
+## 0. References first, then the palette
+
+- **Known subject? Search before you build.** A named character (anime, game, film), a known
+  creature, a franchise weapon or item, a vehicle model, a landmark, a real product: call
+  **`find_references {query, kind}`** first — even when the user already gave an image, because
+  you still need the back, the sides and the small parts. It returns ONE numbered contact
+  sheet (safe search on) plus a short Wikipedia description. Pick 2–4 that show the whole
+  subject clearly (official art, turnaround / reference sheets, front/side/back views; skip
+  fan restyles, cosplay and crops) and load them: `find_references {load:[2,5]}` or
+  `load_reference {result:N}` / `{url}`.
+- The **user's own image wins** where references disagree (outfit, pose); the web references
+  fill in the angles it does not show.
+- **`zoom_reference {rect:[x,y,w,h]}`** enlarges a detail (face, buckle, hem) so you count
+  what is there instead of guessing.
+- **`make_palette`** turns the reference into named colour families with 5-step hue-shifted
+  ramps: point `regions:[{name:"hair", x:0.5, y:0.12}, …]` at flat-lit spots. For a text-only
+  brief pass `colors:{hair:"#…"}` or `base_color` + `scheme` + `mood`. Then texture with
+  `color:"$hair"`, `"$hair.shadow"`, `"$hair.light"`.
+
 ## 1. Cube budget — the non-negotiable floor
 
 | What you are building | Cubes |
 |---|---|
 | Simple prop / small item (potion, key, dagger, crate) | **30–60** |
 | Standard mob / NPC / creature | **100–180** |
-| Hero model / boss / detailed character | **180–300+** |
+| Hero model / boss / detailed character | **180–350** |
 
 **A humanoid built from fewer than 70 cubes is a draft, not a model.** It does not go to
 texturing, it does not go to review, it gets more geometry. `audit_complexity` is the gate and
@@ -39,7 +58,9 @@ returns `too_primitive` / `acceptable` / `high_detail` — treat `too_primitive`
 instruction, not an opinion.
 
 Cube count is necessary, not sufficient: 200 cubes in one flat plane is still flat. The budget
-buys you the four layers below.
+buys you the four layers below. **Detailed but optimised:** every cube must be visible and do a
+job — `check_model` flags `hidden_cube` (fully buried, invisible, still exported); merge what
+reads as one surface; spend the budget on the outside (face, hands, silhouette, trims).
 
 ## 2. The 4-layer doctrine — build outward
 
@@ -83,7 +104,17 @@ flat detail from a character grid; `extrude_chain` builds horns, tails, tentacle
 | **`generate_array`** | Repeats an element along a line / ring / grid | Hems, shingles, scales, feathers, armour plates, teeth, spinal spikes, rivets, fence posts, chain links, ribs |
 | **`extrude_chain`** | A tapering, curving chain, one bone per segment | Horns, antlers, tails, tentacles, claws, tusks, branches, snake bodies, braids, cables, antennae |
 | **`add_wing`** | Arm → forearm → finger fan bones plus a continuous membrane back to the body | Bat, dragon, demon and wyvern wings — anything with skin stretched between bones |
+| **`add_flare`** | A ring of tilted panels from a top ring to a bottom ring | Skirts (pleated), dresses, capes (`arc_degrees` ~200), coat tails, faulds, lampshades, cone roofs |
+| **`add_hair`** | Cap + crown, hairline, tapered bangs, side locks, back strands, tail bone chains with ribbons/bows, ahoge, bun, spikes | Any character with hair — never a helmet box |
+| **`add_cylinder`** | A regular polygon of rotated bands (solid) or a ring of slabs (`inner_radius`) | Wheels, barrels, pillars, logs, cans, lenses, coins, drums |
+| **`add_gear`** | Teeth + disc or spoked rim + hub + axle on its own bone; `mesh_with` places the next gear so the teeth interleave | Clockwork, engines, machines, steampunk |
+| **`add_pipe`** | Round segments through points + fittings + flanges | Pipes, cables, rails, exhausts |
 | **`audit_complexity`** | Measures budget, monoliths, layering, micro-detail, bare faces | The gate before texturing |
+
+**Placing cubes yourself:** `add_cubes` takes `center`+`size`, **`attach:{to, face, at:[a,b], embed}`**
++ `size` (the part lands ON that face, follows the target's rotation and bone, never floats;
+`to` may name a cube created earlier in the same call) and **`mirror:true`** (the twin on the
+other side, named `_right`/`_left`). Hand-computed `[from,to]` is where placement goes wrong.
 
 Key parameters worth remembering:
 
@@ -119,17 +150,19 @@ Use the generators for repetitive mass and `add_cubes` for the shapes only you c
   (`generate_array`'s `depth_stagger` does it for you). Two coplanar faces z-fight — the
   flickering "two squares inside each other".
 - When two cubes overlap, let one clearly **penetrate** the other by ≥0.1 (ideally ~0.5).
-- `check_model` reports `coplanar_overlap` pairs. Fix every one.
-- **The generators grade their own output.** Each returns `z_fight_pairs` when cubes it just
-  made share a face plane (a row where each element overlaps *two* neighbours still lines up,
-  and elements at the same height share their top/bottom planes) plus the fix to apply — more
-  `jitter`, wider spacing, or a small `rotation_range`. Act on it in the same pass.
+- **Z-fighting is fixed automatically** for everything a tool creates (`z_fight_fixed` in the
+  result: the smaller cube of each coplanar pair gets a tiny inflate, UVs untouched). Anything
+  left over comes back as `z_fight_pairs`. After manual edits run **`fix_z_fighting`**.
+- `check_model` works in world space (rotations, bones, inflate) and reports `coplanar_overlap`,
+  `duplicate_cube`, `floating_part`, `hidden_cube`, `off_pixel_grid`, `texel_density_mismatch`.
 
 ## The pipeline (loop it; the first pass is never good enough)
 
 ```
+0  find_references      known subject? ALWAYS — load 2-4, zoom_reference the details
+   make_palette         named colour ramps from the reference (or the text brief)
 1  get_reference        SEE the target; split the silhouette into the four layers
-2  get_status / get_guide {topic:"detailing"}
+2  get_status / get_guide {topic:"detailing" | "character" | "mechanism"}
 3  create_rig           anatomy, joints on pivots, 3-segment limbs, correct L/R
 4  add_cubes            Layer 1 primary mass
 5  add_hollow_volume    Layer 0 cavities + Layer 2 shells (hood, helmet, armour)
@@ -137,9 +170,10 @@ Use the generators for repetitive mass and `add_cubes` for the shapes only you c
 7  voxelize_matrix / extrude_chain   Layer 4 weapons, emblems, horns, micro-detail
 8  audit_complexity     verdict must not be too_primitive
    compare_reference    silhouette match_percent >= 85
-   check_model          zero coplanar_overlap / untextured faces / unparented cubes
+   check_model          zero coplanar_overlap / floating / hidden / unparented cubes
+   inspect_model        CLOSE-UPS of every problem spot + face, hands, joints — study them
    -> FIX the biggest problem, then repeat from 4
-9  pack_uv -> create_texture -> detail_cubes (gradient bake) -> paint_faces (features)
+9  pack_uv -> create_texture -> detail_cubes (materials + patterns + $palette) -> paint_face
 10 check_rig -> generate_animation -> analyze_animation -> refine -> preview_animation
 11 request_review       the USER decides it is done, per milestone
 12 save_project + export
@@ -193,16 +227,20 @@ the result ("close enough"). Use the reference engine so the match is a measured
    `compare_reference` must be ≥85, BEFORE you spend a texturing pass. Texturing a blockout
    wastes the whole pass and hides the real problem.
 
-2. **Box UV does NOT auto-pack.** Newly created cubes all get `uv_offset [0,0]` and overlap.
-   Run **`pack_uv`** (or the shelf-packer script) after the LAST geometry call and before
-   texturing, and re-pack whenever you add or resize cubes.
+2. **UVs do NOT auto-pack.** Newly created cubes all sit at `[0,0]` and overlap. Run
+   **`pack_uv`** after the LAST geometry call and before texturing, and re-pack whenever you
+   add or resize cubes. In Bedrock/GeckoLib it gives cubes thinner than 1 unit or off the pixel
+   grid (gear teeth, hair strands, lace, rotated bands) per-face UV with whole-pixel faces —
+   box UV would collapse them to zero width.
 
-3. **Texture SMOOTH, not noisy.** Per face: a soft vertical gradient in the base colour +
-   directional shading (up lighter, down darker) + *subtle* low-contrast mottle, then a **3x3
-   box blur per UV island**. No harsh per-pixel noise, no dark 1px outline on every face — that
-   reads as a dirty grid. Paint crisp features (eyes/claws) AFTER the blur. `detail_cubes` does
-   the base coat; its `colors` regex list matches on **cube names**, which is exactly why the
-   generators let you name what they produce.
+3. **Texture with materials.** `detail_cubes {materials:[{match, material, color, pattern}]}`
+   shades every pixel from its 3D point: hue-shifted ramps (cool shadows, warm lights), ambient
+   occlusion, 1px bevels, per-material detail (cloth folds, hair strands + shine, metal sheen and
+   scratches, wood grain, stitching) and world-space patterns (plaid, stripes, panels + rivets,
+   lace/trim borders with zigzag edges, hazard, bricks, scales…). Rules match **cube names**,
+   which is why every generator names what it makes. `finish:"cel"` for anime, `"pixel"` for
+   dithered pixel art. Then **`paint_face`** for eyes/brows/mouth/blush in the face's own grid,
+   and `paint_faces` for other crisp marks.
 
 4. **Use rotation.** A single cube rotates cleanly on one axis; for compound angles put it in a
    GROUP and rotate the group, or nest groups. A bone's `+X` rotation tilts its front (`-Z`) up,
@@ -222,27 +260,35 @@ the result ("close enough"). Use the reference engine so the match is a measured
    BRIGHT with no dark shading and no blur. Generators accept the name, so
    `palette:{'o':{name:'eye_core'}}` is enough to make a voxelized eye glow.
 
-8. **REVIEW CRITICALLY.** When a screenshot looks off, FIX it — never write "good enough" about
-   a flaw you can see. Compare against the reference, not your own lowered bar.
+8. **REVIEW CRITICALLY — and up close.** Four whole-body views hide the bugs that matter.
+   `screenshot_views` now appends close-ups of the problem spots, and **`inspect_model`** gives
+   up to 16: each frames the spot tight, x-rays away what stands in front, outlines the cubes
+   involved and captions what is wrong (z-fight, floating, hidden, wrong side) — then the face,
+   hands, feet, joints and gear contacts. Aim it yourself with `{cubes:[…]}` or `{at:[x,y,z]}`.
+   When a close-up looks off, FIX it — never write "good enough" about a flaw you can see.
 
 ## Tool cheat-sheet
 
-- Discover/plan: `get_status`, `get_guide` (topics: **detailing**, modeling, orientation,
-  rigging, texturing, vfx, animation, review, reference), `list_outliner`, `get_element`,
-  `list_formats`.
+- Discover/plan: `get_status`, `get_guide` (topics: **detailing**, **character**, **mechanism**,
+  **inspection**, modeling, orientation, rigging, texturing, vfx, animation, review, reference),
+  `list_outliner`, `get_element`, `list_formats`.
+- References & colour: **`find_references`**, `load_reference {result|url|path}`,
+  **`zoom_reference`**, **`make_palette`**, `get_palette`.
 - Sides: `get_orientation`, `which_side`, `check_sides`.
 - Reference-match: `get_reference`, `load_reference`, `compare_reference`, `measure_model`,
   `list/clear_references`.
-- Build: `add_groups`, `add_cubes` (bulk), **`voxelize_matrix`**, **`add_hollow_volume`**,
-  **`generate_array`**, **`extrude_chain`**, `add_plane`, `add_mesh`, `edit_element`,
-  `delete_element`, `mirror_element`.
+- Build: `add_groups`, `add_cubes` (bulk; center/size, attach, mirror), **`add_flare`**,
+  **`add_hair`**, **`add_cylinder`**, **`add_gear`**, **`add_pipe`**, **`voxelize_matrix`**,
+  **`add_hollow_volume`**, **`generate_array`**, **`extrude_chain`**, `add_wing`, `add_plane`,
+  `add_mesh`, `edit_element`, `delete_element`, `mirror_element`.
 - Rig: `create_rig` (humanoid/quadruped, segmented), `check_rig`, `get_rig`.
 - Quality gates: **`audit_complexity`** (density + monoliths + layering), `check_model`
-  (z-fighting, untextured faces, UVs), `check_sides`, `check_rig`.
-- Texture: `pack_uv`, `create_texture`, `detail_cubes`, `paint_faces`, `paint_texture`,
+  (z-fighting, floating/hidden parts, UVs), **`fix_z_fighting`**, **`inspect_model`**
+  (close-ups), `check_sides`, `check_rig`.
+- Texture: `pack_uv`, `create_texture`, `detail_cubes`, **`paint_face`**, `paint_faces`, `paint_texture`,
   `get_texture`, `apply_texture`, `create_vfx_texture`, `set_texture_render_mode`.
 - Review: `screenshot`, `screenshot_views`, **`request_review`**, **`ask_user`**.
-- Animate: `generate_animation`, `analyze_animation`, `preview_animation`, `create_animation`,
+- Animate: **`animate_mechanism`** (gears/pistons/levers, ratios worked out), `generate_animation`, `analyze_animation`, `preview_animation`, `create_animation`,
   `add_keyframes`, `list_animations`.
 - Export: `save_project`, `export_project`, `export_model` (glTF/other codecs to a path).
 - Escape hatch: `execute_script` — full Blockbench API. An explicit `return` is required;

@@ -44,6 +44,20 @@ const HEAVY_ACTIONS = new Set([
   "paint_texture",
   "pack_uv",
   "create_rig",
+  "add_cylinder",
+  "add_gear",
+  "add_pipe",
+  "add_flare",
+  "add_hair",
+  "paint_face",
+  "fix_z_fighting",
+  "check_model",
+  "animate_mechanism",
+  "inspect_model",
+  "screenshot_views",
+  "make_palette",
+  "contact_sheet",
+  "load_reference",
 ]);
 
 /**
