@@ -254,6 +254,70 @@ test("add_cubes points at the budget and the generators instead of 6-8 boxes", (
   }
 });
 
+// --- meshes -----------------------------------------------------------------
+
+test("add_mesh says where the shape lands and that origin is only the pivot", () => {
+  const p = props("add_mesh");
+  assert.match(p.from.description, /from\.\.from\+size/);
+  assert.match(p.origin.description, /pivot only/i);
+  assert.match(p.texture.description, /unknown name is an error/i);
+});
+
+test("add_meshes takes a list of add_mesh specs and states its limits", () => {
+  assert.deepEqual(required("add_meshes"), ["meshes"]);
+  const meshes = props("add_meshes").meshes;
+  assert.equal(meshes.type, "array");
+  assert.equal(meshes.items.type, "object");
+  const d = byName("add_meshes").description;
+  assert.match(d, /add_mesh/);
+  assert.match(d, /before anything is created/);
+  assert.match(d, /200/);
+  // A client that sends one spec instead of a list still gets a list through.
+  const one = coerceArgs(byName("add_meshes").inputSchema, { meshes: { shape: "gem" } });
+  assert.deepEqual(one.meshes, [{ shape: "gem" }]);
+});
+
+test("get_element says a mesh reports its origin and bounds", () => {
+  const d = byName("get_element").description;
+  assert.match(d, /mesh/);
+  assert.match(d, /bounds/);
+  assert.match(byName("add_meshes").description, /bounds/);
+});
+
+test("edit_element offers `offset` for moving, and says which elements take from/to/inflate", () => {
+  const p = props("edit_element");
+  assert.equal(p.offset.type, "array");
+  assert.deepEqual(p.offset.items, { type: "number" });
+  assert.equal(p.offset.maxItems, 3);
+  assert.match(p.offset.description, /armature/, "offset says what it refuses");
+  for (const key of ["from", "to"]) {
+    assert.match(p[key].description, /cubes and bounding boxes only/i, `${key} should say which elements take it`);
+  }
+  assert.match(p.inflate.description, /cubes only/i);
+  assert.match(byName("edit_element").description, /offset/);
+  assert.match(byName("edit_element").description, /mesh/);
+  assert.deepEqual(coerceArgs(byName("edit_element").inputSchema, { offset: "0,-2,1" }).offset, [0, -2, 1]);
+});
+
+// --- textures ---------------------------------------------------------------
+
+test("create_textures takes a list of solid fills and says it refuses a data_url", () => {
+  assert.deepEqual(required("create_textures"), ["textures"]);
+  const textures = props("create_textures").textures;
+  assert.equal(textures.type, "array");
+  assert.equal(textures.items.type, "object");
+  const d = byName("create_textures").description;
+  assert.match(d, /data_url is refused/);
+  assert.match(d, /64/);
+  assert.match(d, /4096/);
+});
+
+// --- view -------------------------------------------------------------------
+
+test("set_camera_angle can switch to orthographic and back", () => {
+  assert.deepEqual(props("set_camera_angle").angle.enum, ["ortho", "perspective"]);
+});
+
 // --- argument coercion (clients serialize arrays differently) ---------------
 
 test("coerceArgs parses JSON text into the arrays and objects a schema wants", () => {

@@ -1159,14 +1159,28 @@ const catalogue: ToolDef[] = [
           description: "Primitive shape (default 'crystal').",
         },
         size: vec3("Bounding size [w,h,d] (default [8,8,8]). For a shard make h large."),
-        from: vec3("Lower-corner placement of the bounding box (defaults to centred on x/z at y=0)."),
-        origin: vec3("Rotation pivot (defaults to the shape centre)."),
-        rotation: vec3("Rotation in degrees [x,y,z]."),
-        segments: { type: "number", description: "Radial segments for cone/cylinder (default 8)." },
-        texture: { type: "string", description: "Texture to apply (defaults to the project default)." },
+        from: vec3("Lower corner of the bounding box: the shape always spans from..from+size (defaults to centred on x/z at y=0)."),
+        origin: vec3("Rotation pivot only — it does not move the shape (defaults to the shape centre)."),
+        rotation: vec3("Rotation in degrees [x,y,z], about `origin`."),
+        segments: { type: "number", description: "Radial segments for cone/cylinder: a whole number (default 8, at most 128)." },
+        texture: { type: "string", description: "Texture to apply (defaults to the project default). An unknown name is an error." },
         uv: { type: "array", items: { type: "number" }, description: "UV rect [x1,y1,x2,y2] every face maps into (defaults to the whole texture)." },
         parent: { type: "string", description: "uuid or name of the parent bone/group." },
       }
+    )
+  ),
+  forward(
+    "add_meshes",
+    "Create many MESH primitives in one call — the mesh counterpart of add_cubes, and much faster than one add_mesh per part. Pass `meshes`: an array where each item takes the same fields as add_mesh ({name, shape, size, from, origin, rotation, segments, texture, uv, parent}); each shape spans exactly from..from+size, and `origin` is only its pivot. Every item is checked (parent, texture, shape) before anything is created, so one bad item fails the whole call instead of leaving half of it built. At most 200 per call, segments at most 128. Returns each mesh with its uuid and bounds.",
+    obj(
+      {
+        meshes: {
+          type: "array",
+          description: "Array of mesh specs (each like add_mesh's args).",
+          items: { type: "object" },
+        },
+      },
+      ["meshes"]
     )
   ),
   forward(
@@ -1181,16 +1195,17 @@ const catalogue: ToolDef[] = [
   ),
   forward(
     "edit_element",
-    "Edit an existing cube or group (rename, move, rotate, reparent, resize, inflate, visibility).",
+    "Edit an existing cube, mesh or group (rename, move, rotate, reparent, resize, inflate, visibility). To MOVE a cube, a mesh, a locator, a bounding box, or a group with everything in it, pass `offset`: it translates the whole thing and keeps its shape, so a misplaced part never needs deleting and re-adding.",
     obj(
       {
-        element: { type: "string", description: "uuid or name of the cube/group to edit." },
+        element: { type: "string", description: "uuid or name of the cube, mesh or group to edit." },
         new_name: { type: "string" },
-        from: vec3("New lower corner (cubes only)."),
-        to: vec3("New upper corner (cubes only)."),
-        origin: vec3("New pivot."),
+        offset: vec3("Move by [dx,dy,dz] in model coordinates: a cube's from/to/origin, a bounding box's from/to, a mesh's origin, a locator's position, or a group's origin plus everything inside it. An armature or bone (its children would stay behind) is an error, as is a group holding one, and then nothing moves. Inside a rotated parent group the move you SEE is that rotation applied to the offset."),
+        from: vec3("New lower corner (cubes and bounding boxes only — an error on anything else)."),
+        to: vec3("New upper corner (cubes and bounding boxes only — an error on anything else)."),
+        origin: vec3("New pivot. On a MESH this moves the whole mesh (its vertices are relative to it) — prefer `offset`."),
         rotation: vec3("New rotation in degrees."),
-        inflate: { type: "number" },
+        inflate: { type: "number", description: "Cubes only — an error on anything else." },
         visibility: { type: "boolean" },
         parent: { type: "string", description: "uuid/name of new parent group, or 'root'." },
       },
@@ -1209,7 +1224,7 @@ const catalogue: ToolDef[] = [
   ),
   forward(
     "get_element",
-    "Get detailed info for one cube or group by uuid or name.",
+    "Get detailed info for one cube, mesh or group by uuid or name. A mesh reports its origin and its model-space `bounds` (rotation ignored) — the way to check where a mesh actually sits, since measure_model and screenshot framing only see cubes.",
     obj({ element: { type: "string" } }, ["element"])
   ),
 
@@ -1250,6 +1265,20 @@ const catalogue: ToolDef[] = [
       },
       particle: { type: "boolean", description: "Mark as particle texture (some formats)." },
     })
+  ),
+  forward(
+    "create_textures",
+    "Create several solid-colour textures in one call — a model's whole material set (e.g. metal, dark_metal, glow) at once. Pass `textures`: an array of {name, fill, width?, height?}; width/height default to the project texture size. Solid fills only — an item carrying a data_url is refused (use create_texture for that). Every item is checked before any texture is made. At most 64 per call, each side a whole number of at most 4096. Returns each texture's uuid.",
+    obj(
+      {
+        textures: {
+          type: "array",
+          description: "Array of {name, fill:'#rrggbb', width?, height?}.",
+          items: { type: "object" },
+        },
+      },
+      ["textures"]
+    )
   ),
   forward(
     "create_vfx_texture",
@@ -1559,7 +1588,7 @@ const catalogue: ToolDef[] = [
       preset: { type: "string", description: "A camera angle preset id (e.g. 'front', 'isometric_right_front')." },
       position: vec3("Explicit camera position [x,y,z]."),
       target: vec3("Look-at target [x,y,z]."),
-      angle: { type: "string", description: "'ortho' to switch to orthographic projection." },
+      angle: { type: "string", enum: ["ortho", "perspective"], description: "'ortho' switches to orthographic projection, 'perspective' back again." },
     })
   ),
   {

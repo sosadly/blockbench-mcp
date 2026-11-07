@@ -280,13 +280,15 @@ the result ("close enough"). Use the reference engine so the match is a measured
 - Build: `add_groups`, `add_cubes` (bulk; center/size, attach, mirror), **`add_flare`**,
   **`add_hair`**, **`add_cylinder`**, **`add_gear`**, **`add_pipe`**, **`voxelize_matrix`**,
   **`add_hollow_volume`**, **`generate_array`**, **`extrude_chain`**, `add_wing`, `add_plane`,
-  `add_mesh`, `edit_element`, `delete_element`, `mirror_element`.
+  `add_mesh`, `add_meshes` (bulk), `edit_element` (`offset` moves a part, or a group with
+  everything in it), `delete_element`, `mirror_element`.
 - Rig: `create_rig` (humanoid/quadruped, segmented), `check_rig`, `get_rig`.
 - Quality gates: **`audit_complexity`** (density + monoliths + layering), `check_model`
   (z-fighting, floating/hidden parts, UVs), **`fix_z_fighting`**, **`inspect_model`**
   (close-ups), `check_sides`, `check_rig`.
-- Texture: `pack_uv`, `create_texture`, `detail_cubes`, **`paint_face`**, `paint_faces`, `paint_texture`,
-  `get_texture`, `apply_texture`, `create_vfx_texture`, `set_texture_render_mode`.
+- Texture: `pack_uv`, `create_texture`, `create_textures` (bulk), `detail_cubes`, **`paint_face`**,
+  `paint_faces`, `paint_texture`, `get_texture`, `apply_texture`, `create_vfx_texture`,
+  `set_texture_render_mode`.
 - Review: `screenshot`, `screenshot_views`, **`request_review`**, **`ask_user`**.
 - Animate: **`animate_mechanism`** (gears/pistons/levers, ratios worked out), `generate_animation`, `analyze_animation`, `preview_animation`, `create_animation`,
   `add_keyframes`, `list_animations`.

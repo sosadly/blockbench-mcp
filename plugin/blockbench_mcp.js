@@ -417,6 +417,15 @@ function serializeElement(el) {
 			autouv: el.autouv,
 			faces: serializeFaces(el),
 		});
+	} else if (typeof Mesh !== 'undefined' && el instanceof Mesh) {
+		// Where the mesh actually sits: its vertices are relative to the origin.
+		Object.assign(out, {
+			origin: el.origin,
+			rotation: el.rotation,
+			bounds: meshBounds(el),
+			vertices: Object.keys(el.vertices).length,
+			faces: Object.keys(el.faces).length,
+		});
 	}
 	return out;
 }
@@ -511,6 +520,11 @@ function blankTextureDataURL(width, height, fill) {
 	}
 	return c.toDataURL('image/png');
 }
+
+// create_textures makes a model's material set, not an atlas: cap how many and
+// how big, so one malformed call can't ask Blockbench for an enormous canvas.
+const MAX_TEXTURE_BATCH = 64;
+const MAX_TEXTURE_SIDE = 4096;
 
 // --- colour helpers ---------------------------------------------------------
 let _colorCanvas = null;
@@ -1589,6 +1603,162 @@ function setMeshFaceUV(mesh, face, rect) {
 		];
 	});
 	face.uv = uv;
+}
+
+// ---------------------------------------------------------------------------
+// Mesh creation. Two facts about Blockbench's Mesh decide how this is written:
+//   * its constructor seeds a default 4x4x4 cube (8 vertices, 6 faces) whenever
+//     `data.vertices` is missing, so a mesh built vertex by vertex has to start
+//     from `vertices: {}` or it carries that cube next to its real shape;
+//   * vertices are stored RELATIVE to the mesh's origin, so a shape meant to
+//     span from..from+size is written at from + v - origin. The origin is only
+//     the rotation pivot; it never moves the shape.
+// ---------------------------------------------------------------------------
+
+// add_meshes builds every spec's geometry before creating any of it, so these
+// keep one call from freezing Blockbench many times over.
+const MAX_MESH_BATCH = 200;
+const MAX_MESH_SEGMENTS = 128;
+
+function requireMeshFormat() {
+	if (typeof Mesh === 'undefined') throw new Error('Meshes are not available in this Blockbench build.');
+	if (Format && Format.meshes === false) throw new Error('Current format does not support meshes. Use a free/generic project, or build the shape from rotated cubes.');
+}
+
+/** Resolve an add_mesh spec up front, so a bad one throws before anything is created. */
+function resolveMeshSpec(p) {
+	const parent = p.parent ? findGroup(p.parent) : null;
+	if (p.parent && !parent) throw new Error('Parent group not found: ' + p.parent);
+	const tex = p.texture ? findTexture(p.texture) : (Texture.getDefault ? Texture.getDefault() : Texture.all[0]);
+	if (p.texture && !tex) throw new Error('Texture not found: ' + p.texture);
+	const shape = (p.shape || 'crystal').toLowerCase();
+	const size = num3(p.size, [8, 8, 8]);
+	const from = num3(p.from, [-size[0] / 2, 0, -size[2] / 2]);
+	const origin = num3(p.origin, [from[0] + size[0] / 2, from[1] + size[1] / 2, from[2] + size[2] / 2]);
+	// A fractional count makes meshPrimitive emit fractional ring indices, which
+	// only fail once the mesh is half built, so refuse it here with the rest.
+	const segments = p.segments === undefined ? undefined : Number(p.segments);
+	if (segments !== undefined && !(Number.isInteger(segments) && segments <= MAX_MESH_SEGMENTS)) {
+		throw new Error(`segments must be a whole number, at most ${MAX_MESH_SEGMENTS} (got ${p.segments}).`);
+	}
+	const prim = meshPrimitive(shape, size[0], size[1], size[2], segments);
+	const uvRect = Array.isArray(p.uv) ? p.uv : [0, 0, Project.texture_width, Project.texture_height];
+	return { name: p.name || shape, shape, from, origin, rotation: num3(p.rotation, [0, 0, 0]), prim, tex, uvRect, parent };
+}
+
+function createMesh(s) {
+	const mesh = new Mesh({ name: s.name, origin: s.origin, rotation: s.rotation, vertices: {} });
+	const keys = s.prim.verts.map((v) => mesh.addVertices([
+		s.from[0] + v[0] - s.origin[0],
+		s.from[1] + v[1] - s.origin[1],
+		s.from[2] + v[2] - s.origin[2],
+	])[0]);
+	s.prim.faces.forEach((face) => {
+		const f = new MeshFace(mesh, { vertices: face.map((i) => keys[i]) });
+		if (s.tex) f.texture = s.tex.uuid;
+		mesh.addFaces(f);
+		setMeshFaceUV(mesh, f, s.uvRect);
+	});
+	mesh.init().addTo(s.parent || 'root');
+	return mesh;
+}
+
+/** A mesh's axis-aligned bounds in model space (rotation ignored, like measure_model). */
+function meshBounds(mesh) {
+	// A plain loop, not Math.min(...spread): spreading a high-poly imported mesh's
+	// vertices overflows the call stack, and every serializeElement comes through here.
+	const o = mesh.origin;
+	const lo = [Infinity, Infinity, Infinity];
+	const hi = [-Infinity, -Infinity, -Infinity];
+	for (const key in mesh.vertices) {
+		const v = mesh.vertices[key];
+		for (let i = 0; i < 3; i++) {
+			const c = v[i] + o[i];
+			if (c < lo[i]) lo[i] = c;
+			if (c > hi[i]) hi[i] = c;
+		}
+	}
+	if (lo[0] === Infinity) return null;
+	const r = (n) => Math.round(n * 1000) / 1000;
+	return { from: lo.map(r), to: hi.map(r) };
+}
+
+function serializeMesh(mesh, shape) {
+	return {
+		uuid: mesh.uuid, name: mesh.name, type: 'mesh', shape,
+		origin: mesh.origin, bounds: meshBounds(mesh),
+		vertices: Object.keys(mesh.vertices).length, faces: Object.keys(mesh.faces).length,
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Moving outliner nodes (edit_element's `offset`)
+// ---------------------------------------------------------------------------
+
+/** Whether `obj[key]` can be written: a value or a setter, not a getter that aliases another field or a constant. */
+function isStoredProperty(obj, key) {
+	for (let o = obj; o; o = Object.getPrototypeOf(o)) {
+		const d = Object.getOwnPropertyDescriptor(o, key);
+		if (d) return 'value' in d || typeof d.set === 'function';
+	}
+	return false;
+}
+
+/**
+ * The vectors that place an element and can actually be written. Blockbench
+ * answers some of these names with a getter that has no setter: a mesh's
+ * `position` returns its origin, a locator's, null object's or billboard's
+ * `origin` returns its position, and a bounding box's origin and position both
+ * return a fresh [0,0,0]. Assigning to one of those silently does nothing.
+ */
+function storedPlacement(node) {
+	return ['from', 'to', 'origin', 'position'].filter((k) => Array.isArray(node[k]) && isStoredProperty(node, k));
+}
+
+/**
+ * Why `offset` can't move `node`, or '' when it can. Checked for everything a
+ * group holds before anything moves, so an offset never reports success while
+ * leaving part of the model where it was.
+ */
+function explainCannotMove(node) {
+	if (node instanceof Group) {
+		for (const child of node.children) {
+			const reason = explainCannotMove(child);
+			if (reason) return reason;
+		}
+		return '';
+	}
+	const what = `"${node.name}" (${node.type || 'element'})`;
+	// An armature or a bone has children of its own, which moving it alone would leave behind.
+	if (Array.isArray(node.children)) return `offset can't move ${what}: it has children that would not move with it.`;
+	if (!storedPlacement(node).length) return `offset can't move ${what}: it has no position to move.`;
+	return '';
+}
+
+/**
+ * Translate a group with everything inside it, or an element by every placement
+ * vector it stores, by `d`: a cube's from/to/origin, a bounding box's from/to, a
+ * mesh's origin (its vertices are relative to it), a locator's position.
+ */
+function moveNode(node, d) {
+	const add = (v) => [v[0] + d[0], v[1] + d[1], v[2] + d[2]];
+	if (node instanceof Group) {
+		node.origin = add(node.origin);
+		node.children.forEach((child) => moveNode(child, d));
+	} else {
+		for (const key of storedPlacement(node)) node[key] = add(node[key]);
+	}
+}
+
+/** Everything inside a group, split into sub-groups and elements, for Undo. */
+function descendants(group) {
+	const groups = [];
+	const elements = [];
+	const walk = (g) => g.children.forEach((c) => {
+		if (c instanceof Group) { groups.push(c); walk(c); } else elements.push(c);
+	});
+	walk(group);
+	return { groups, elements };
 }
 
 // ---------------------------------------------------------------------------
@@ -7083,7 +7253,8 @@ const commands = {
 				});
 			} else if (mode === 'mesh') {
 				const origin = lift(pn.bone.rest, 0);
-				const mesh = new Mesh({ name: pn.name, origin: origin.map(R3), rotation: [0, 0, 0] });
+				// `vertices: {}` stops Blockbench seeding its default cube into the panel.
+				const mesh = new Mesh({ name: pn.name, origin: origin.map(R3), rotation: [0, 0, 0], vertices: {} });
 				const keys = local.map((pt) => {
 					const w = lift(pt, 0);
 					return mesh.addVertices([w[0] - origin[0], w[1] - origin[1], w[2] - origin[2]])[0];
@@ -7459,33 +7630,34 @@ const commands = {
 	// cubes only, so for those build crystals from rotated cubes instead.
 	add_mesh(p) {
 		requireProject();
-		if (typeof Mesh === 'undefined') throw new Error('Meshes are not available in this Blockbench build.');
-		if (Format && Format.meshes === false) throw new Error('Current format does not support meshes. Use a free/generic project, or build the shape from rotated cubes.');
-		const parent = p.parent ? findGroup(p.parent) : null;
-		if (p.parent && !parent) throw new Error('Parent group not found: ' + p.parent);
-		const shape = (p.shape || 'crystal').toLowerCase();
-		const size = num3(p.size, [8, 8, 8]);
-		const from = num3(p.from, [-size[0] / 2, 0, -size[2] / 2]);
-		const prim = meshPrimitive(shape, size[0], size[1], size[2], p.segments);
-		const tex = p.texture ? findTexture(p.texture) : (Texture.getDefault ? Texture.getDefault() : Texture.all[0]);
-		const uvRect = Array.isArray(p.uv) ? p.uv : [0, 0, Project.texture_width, Project.texture_height];
+		requireMeshFormat();
+		const spec = resolveMeshSpec(p);
 		Undo.initEdit({ outliner: true, elements: [] });
-		const mesh = new Mesh({
-			name: p.name || shape,
-			origin: num3(p.origin, [from[0] + size[0] / 2, from[1] + size[1] / 2, from[2] + size[2] / 2]),
-			rotation: num3(p.rotation, [0, 0, 0]),
-		});
-		const keys = prim.verts.map((v) => mesh.addVertices([from[0] + v[0], from[1] + v[1], from[2] + v[2]])[0]);
-		prim.faces.forEach((face) => {
-			const f = new MeshFace(mesh, { vertices: face.map((i) => keys[i]) });
-			if (tex) f.texture = tex.uuid;
-			mesh.addFaces(f);
-			setMeshFaceUV(mesh, f, uvRect);
-		});
-		mesh.init().addTo(parent || 'root');
-		Undo.finishEdit('MCP: add mesh');
+		const mesh = createMesh(spec);
+		// The after-state has to name the new mesh, or undoing leaves it behind.
+		Undo.finishEdit('MCP: add mesh', { outliner: true, elements: [mesh] });
 		Canvas.updateAll();
-		return { uuid: mesh.uuid, name: mesh.name, type: 'mesh', shape, vertices: Object.keys(mesh.vertices).length, faces: Object.keys(mesh.faces).length };
+		return serializeMesh(mesh, spec.shape);
+	},
+
+	// Many meshes in one call — the mesh counterpart of add_cubes. Every spec is
+	// resolved (parent, texture, shape) before anything is created, so one bad
+	// entry fails the whole batch instead of leaving half of it built.
+	add_meshes(p) {
+		requireProject();
+		requireMeshFormat();
+		const list = toList(p.meshes);
+		if (!list.length) throw new Error('`meshes` must be a non-empty array of add_mesh specs.');
+		if (list.length > MAX_MESH_BATCH) throw new Error(`At most ${MAX_MESH_BATCH} meshes per call (got ${list.length}).`);
+		const specs = list.map((m, i) => {
+			if (!m || typeof m !== 'object' || Array.isArray(m)) throw new Error(`meshes[${i}] must be an object (an add_mesh spec).`);
+			try { return resolveMeshSpec(m); } catch (e) { throw new Error(`meshes[${i}]: ${e.message}`); }
+		});
+		Undo.initEdit({ outliner: true, elements: [] });
+		const created = specs.map(createMesh);
+		Undo.finishEdit('MCP: add meshes', { outliner: true, elements: created });
+		Canvas.updateAll();
+		return { created: created.length, meshes: created.map((m, i) => serializeMesh(m, specs[i].shape)) };
 	},
 
 	// Mirror a cube or group across an axis about a pivot (default x=0) — build
@@ -7535,15 +7707,38 @@ const commands = {
 		const el = findNode(p.element || p.uuid || p.name);
 		if (!el) throw new Error('Element not found: ' + (p.element || p.uuid || p.name));
 		const isGroup = el instanceof Group;
-		Undo.initEdit(isGroup ? { group: el } : { elements: [el] });
+		// from/to only mean something where they are stored, as a cube's or a
+		// bounding box's corners: a group ignored them, and a mesh or locator got
+		// them as stray properties that did nothing. inflate is a cube's alone.
+		// Refuse all of it, and an offset that can't move everything, up front.
+		const hasBox = isStoredProperty(el, 'from') && isStoredProperty(el, 'to');
+		if (!hasBox && (p.from || p.to)) {
+			throw new Error(`from/to apply only to cubes and bounding boxes; to move "${el.name}" pass offset.`);
+		}
+		if (!(el instanceof Cube) && p.inflate !== undefined) {
+			throw new Error(`inflate applies to cubes only, and "${el.name}" is not one.`);
+		}
+		if (p.offset) {
+			const reason = explainCannotMove(el);
+			if (reason) throw new Error(reason);
+		}
+		// An offset on a group moves every sub-group and element inside it, so Undo
+		// has to snapshot all of them, not just the group itself.
+		let undoAspects = isGroup ? { group: el } : { elements: [el] };
+		if (isGroup && p.offset) {
+			const inside = descendants(el);
+			undoAspects = { groups: [el, ...inside.groups], elements: inside.elements };
+		}
+		Undo.initEdit(undoAspects);
 		if (p.new_name !== undefined) el.name = p.new_name;
 		if (p.origin) el.origin = num3(p.origin, el.origin);
 		if (p.rotation) el.rotation = num3(p.rotation, el.rotation);
-		if (!isGroup) {
+		if (hasBox) {
 			if (p.from) el.from = num3(p.from, el.from);
 			if (p.to) el.to = num3(p.to, el.to);
-			if (p.inflate !== undefined) el.inflate = Number(p.inflate);
 		}
+		if (el instanceof Cube && p.inflate !== undefined) el.inflate = Number(p.inflate);
+		if (p.offset) moveNode(el, num3(p.offset, [0, 0, 0]));
 		if (p.visibility !== undefined) el.visibility = !!p.visibility;
 		if (p.parent !== undefined) {
 			const parent = p.parent === 'root' ? 'root' : findGroup(p.parent);
@@ -7811,6 +8006,34 @@ const commands = {
 				finish();
 			}
 		});
+	},
+
+	// Several solid-colour textures in one call (a model's material set). Solid
+	// fills only: an item never takes a data_url, so a batch can't load an image.
+	// Everything is checked before the first texture is made.
+	async create_textures(p) {
+		requireProject();
+		const list = toList(p.textures);
+		if (!list.length) throw new Error('`textures` must be a non-empty array of {name, fill, width?, height?}.');
+		if (list.length > MAX_TEXTURE_BATCH) throw new Error(`At most ${MAX_TEXTURE_BATCH} textures per call (got ${list.length}).`);
+		// The items are untyped objects, so nothing on the way here turned '32'
+		// into 32: check the number and forward it, or tex.width ends up a string.
+		const side = (v) => (v === undefined ? undefined : Number(v));
+		list.forEach((t, i) => {
+			if (!t || typeof t !== 'object' || Array.isArray(t)) throw new Error(`textures[${i}] must be an object.`);
+			if (t.data_url !== undefined) throw new Error(`textures[${i}]: create_textures takes solid fills only; use create_texture for a data_url.`);
+			for (const key of ['width', 'height']) {
+				const n = side(t[key]);
+				if (n !== undefined && !(Number.isInteger(n) && n >= 1 && n <= MAX_TEXTURE_SIDE)) {
+					throw new Error(`textures[${i}].${key} must be a whole number 1..${MAX_TEXTURE_SIDE} (got ${t[key]}).`);
+				}
+			}
+		});
+		const out = [];
+		for (const t of list) {
+			out.push(await commands.create_texture({ name: t.name, width: side(t.width), height: side(t.height), fill: t.fill }));
+		}
+		return { created: out.length, textures: out };
 	},
 
 	// Generate a pixelated VFX texture: a bright hot core fading to cool edges in
@@ -8696,6 +8919,10 @@ const commands = {
 		const preview = Preview.selected;
 		if (p.angle && typeof preview.setProjectionMode === 'function' && p.angle === 'ortho') {
 			preview.setProjectionMode(true);
+		}
+		// Without this, 'ortho' was a one-way switch: nothing turned perspective back on.
+		if (p.angle && typeof preview.setProjectionMode === 'function' && p.angle === 'perspective') {
+			preview.setProjectionMode(false);
 		}
 		if (Array.isArray(p.position)) preview.camera.position.set(p.position[0], p.position[1], p.position[2]);
 		if (Array.isArray(p.target) && preview.controls) preview.controls.target.set(p.target[0], p.target[1], p.target[2]);
@@ -10237,8 +10464,8 @@ const LONG_ACTIONS = { request_review: true, ask_user: true, wait_review: true }
  */
 const HEAVY_ACTIONS = {
 	voxelize_matrix: true, generate_array: true, extrude_chain: true, add_wing: true, add_hollow_volume: true,
-	add_cubes: true, add_groups: true, audit_complexity: true, detail_cubes: true,
-	paint_faces: true, paint_texture: true, pack_uv: true, create_rig: true, execute_script: true,
+	add_cubes: true, add_meshes: true, add_groups: true, audit_complexity: true, detail_cubes: true,
+	paint_faces: true, paint_texture: true, create_textures: true, pack_uv: true, create_rig: true, execute_script: true,
 };
 
 const LOOPBACK_HOSTS = { '127.0.0.1': true, 'localhost': true, '[::1]': true };
